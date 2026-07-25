@@ -1,6 +1,6 @@
 # AI Travel Planning and Booking Agent Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Implementation instructions:** Implement the project by following this plan step by step. Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to execute each task, and track progress using Markdown checkboxes (`- [ ]`).
 
 **Goal:** Build an AI travel agent that plans and books a multi-leg trip end to end — searches flights/hotels, builds an itinerary, fills a mock booking form, stops for human approval, emails the confirmation, and logs the trip to a CRM.
 
@@ -33,8 +33,7 @@
 
 - [ ] Review `docs/spec.md` and confirm scope, architecture, and security model.
 - [ ] Review this plan and confirm checkpoint order.
-- [ ] Commit both documents before coding starts.
-- [ ] Open a PR for staff approval if required by the course.
+
 
 ## Checkpoint 2: Project Scaffolding and Configuration
 
