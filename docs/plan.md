@@ -1,12 +1,11 @@
-# AI Travel Planning and Booking Agent — Project Plan
+# AI Travel Planning and Booking Agent — Implementation Plan
 
 **Companion document:** [`docs/spec.md`](spec.md) contains the full design specification
-(architecture, security model, error handling, testing strategy, risks). This document is the
-standalone project plan — timeline, milestones, phase objectives, deliverables, dependencies,
-and acceptance criteria — and does not require opening the detailed sub-plans in `docs/plans/`
-to understand project scope, sequencing, or what "done" means for each phase.
+(architecture, security model, error handling, testing strategy, risks, alternatives
+considered). This document is the implementation roadmap: what gets built, in what order, what
+each task produces, how tasks depend on each other, and how to verify each one is done.
 
-## 1. Project Overview
+## 1. Overview
 
 ### 1.1 Problem Statement
 
@@ -15,19 +14,18 @@ day-by-day itinerary, and filling in booking forms — is tedious. This project 
 agent that automates search, comparison, and itinerary planning end-to-end, while keeping the
 one irreversible/financial step (payment) strictly under human control.
 
-### 1.2 Project Objectives
+### 1.2 Objectives
 
-1. Deliver a full working demo: a user states trip constraints in conversation, receives
-   ranked flight/hotel options (including multi-leg trips), receives a personalized itinerary,
-   picks options, the agent fills a mock booking form via browser automation, the flow stops
-   for **explicit human approval**, a confirmation email is sent, and the trip is logged to a
-   CRM.
-2. Demonstrate a structurally safe human-in-the-loop pattern for an agent operating adjacent to
-   a payment-shaped flow — safety enforced by graph topology and mock-site design, not by
+1. A full working demo: a user states trip constraints in conversation, receives ranked
+   flight/hotel options (including multi-leg trips), receives a personalized itinerary, picks
+   options, the agent fills a mock booking form via browser automation, the flow stops for
+   **explicit human approval**, a confirmation email is sent, and the trip is logged to a CRM.
+2. A structurally safe human-in-the-loop pattern for an agent operating adjacent to a
+   payment-shaped flow — safety enforced by graph topology and mock-site design, not by
    trusting model behavior.
-3. Demonstrate real infrastructure engineering: a self-managed Kubernetes cluster on AWS EC2
-   (kubeadm), provisioned by Terraform and Packer, deployed via GitOps (Argo CD), observed via
-   Prometheus/Grafana, built and shipped via CI/CD.
+3. Real infrastructure: a self-managed Kubernetes cluster on AWS EC2 (kubeadm), provisioned by
+   Terraform and Packer, deployed via GitOps (Argo CD), observed via Prometheus/Grafana, built
+   and shipped via CI/CD.
 
 ### 1.3 Non-Goals
 
@@ -36,316 +34,246 @@ site only); no multi-user accounts/authentication; no mobile app; no dedicated
 points-of-interest API (itinerary content is LLM-generated); no highly-available control plane
 (single node, explicitly accepted limitation). Full rationale in `spec.md` §3.
 
-### 1.4 Overall Success Criteria
+### 1.4 Build Order
 
-The project is complete when: the full conversational flow runs against real sandboxed
-third-party APIs (Amadeus, Gmail, HubSpot) and a purpose-built mock booking site; the entire
-stack is deployed on a self-managed Kubernetes cluster on AWS via Terraform/Packer; GitOps
-(Argo CD) is the sole applier of manifests; CI/CD builds and tags images automatically;
-Prometheus/Grafana show live application and infrastructure metrics; and a full end-to-end run
-(happy path + reject-at-review-gate path) has been demonstrated on the `prod` environment.
+Seven phases, strictly sequential — each assumes every prior phase is implemented and its
+tests pass:
 
----
-
-## 2. Timeline Summary
-
-**Basis:** relative duration in working weeks, assuming a substantial part-time pace of
-roughly 20-25 hours/week (approximated below as 5 working days/week at 4-5 hrs/day). These are
-estimates for planning purposes, not calendar-locked commitments — see §6 for schedule risks
-that could shift them. Re-anchor to real calendar dates once a start date is fixed.
-
-| Phase | Weeks | Cumulative |
-|---|---|---|
-| 1 — Core Agent Logic (sub-phases 1a-1f) | 6 weeks | Weeks 1-6 |
-| 2 — Real Integrations & Mock Booking Site | 4 weeks | Weeks 7-10 |
-| 3 — Infrastructure Provisioning | 3 weeks | Weeks 11-13 |
-| 4 — Kubernetes Deployment | 1 week | Week 14 |
-| 5 — CI/CD and GitOps | 1.5 weeks | Weeks 15-16 (first half) |
-| 6 — Observability | 1.5 weeks | Weeks 16 (second half)-17 |
-| 7 — Production Validation / Demo | 1 week | Week 18 |
-| **Total** | **~18 weeks (~4.5 months)** | |
-
-### Phase 1 Sub-Phase Breakdown (working days, 6 weeks total)
-
-| Sub-phase | Days | Cumulative |
-|---|---|---|
-| 1a — Project Foundation & Database | 7 days | Week 1 – Week 2 (day 2) |
-| 1b — LangGraph Trip Search Flow | 5 days | Week 2 (day 3) – Week 3 (day 2) |
-| 1c — Selection and Interrupts | 3 days | Week 3 (days 3-5) |
-| 1d — Traveler PII and Booking Form | 5 days | Week 4 |
-| 1e — Email, CRM, Idempotency | 3 days | Week 5 (days 1-3) |
-| 1f — Graph Assembly, FastAPI, Full Verification | 7 days | Week 5 (days 4-5) – Week 6 |
+1. **Core Agent Logic** — the LangGraph agent, fully tested against fakes and a real local
+   Postgres. No real MCP servers, no infrastructure.
+2. **Real Integrations & Mock Booking Site** — fakes replaced with real sandboxed
+   integrations; still local.
+3. **Infrastructure Provisioning** — Terraform/Packer/kubeadm cluster on AWS.
+4. **Kubernetes Deployment** — application services deployed to the cluster.
+5. **CI/CD and GitOps** — Argo CD becomes the sole applier of manifests.
+6. **Observability** — Prometheus/Grafana and application-level metrics.
+7. **Production Validation** — full end-to-end verification on the real AWS environment.
 
 ---
 
-## 3. Milestones
+## 2. Global Constraints
 
-| # | Milestone | Marks the end of | Demonstrable outcome |
-|---|---|---|---|
-| M1 | Core agent proven in isolation | Phase 1 | Full `pytest` suite green (~60+ tests) for the complete LangGraph agent (12 nodes, both `interrupt()` gates, encrypted PII, idempotent side effects) running against fakes and a real local Postgres. No real external services yet. |
-| M2 | Full local demo, real integrations | Phase 2 | A person can run the complete conversation locally (Docker Compose) against real Amadeus/Gmail/HubSpot sandboxes and a purpose-built mock booking site, with Playwright filling the form and stopping at the review screen. |
-| M3 | Cloud infrastructure live | Phase 3 | A self-managed Kubernetes cluster (kubeadm) is running on AWS EC2, provisioned entirely by Terraform + Packer, with NetworkPolicies and External Secrets Operator functioning. |
-| M4 | Application running in-cluster | Phase 4 | All services (frontend, backend, mock site, MCP servers, Postgres) deployed to the cluster via Kustomize `dev` overlay, manually verified. |
-| M5 | GitOps live | Phase 5 | A merge to `main` results in Argo CD automatically syncing the updated image to the `dev` overlay, with no manual `kubectl apply`. |
-| M6 | Observability operational | Phase 6 | Grafana dashboards show live application metrics (workflow completions/failures, interrupt/retry counts, MCP latency) and infrastructure metrics, sourced from a working Prometheus scrape. |
-| M7 | **Production validation — final deliverable** | Phase 7 | A complete end-to-end run (happy path, and a reject-at-review-gate path) executes successfully against the real AWS `prod` environment, with the run visible live on the Grafana dashboards. |
+These apply to every task below; each task's acceptance criteria assume them.
 
----
-
-## 4. Phase-by-Phase Plan
-
-### Phase 1 — Core Agent Logic
-
-**Overall objective:** build and fully test the LangGraph agent — all 12 workflow nodes, both
-`interrupt()` gates, encrypted traveler PII, idempotent side effects, sanitized error
-handling — against fake tool/LLM clients and a real local Postgres. No real MCP servers, no
-infrastructure, no cloud.
-
-**Detailed plans:** `docs/plans/01-project-foundation-and-db.md` through
-`docs/plans/06-fastapi-and-error-handling.md` (six sub-phases, executed in order).
-
-#### 1a — Project Foundation and Database (7 days)
-
-- **Objective:** every cross-cutting piece of infrastructure the graph's nodes depend on —
-  settings, domain models, `GraphState` schema, encryption, Postgres tables + migrations, the
-  LangGraph checkpointer, error/retry handling, idempotency, tool/LLM client protocols with
-  fakes, and the shared `NodeDeps` bundle.
-- **Deliverables:** `backend/app/{config,crypto,errors,idempotency,db}.py`; `app/models/`
-  (domain models, ORM models, `GraphState`); `app/llm/`, `app/tools/` (protocols + fakes);
-  `app/graph/deps.py`; Alembic migrations; `docker-compose.yml`; shared test
-  fixtures/factories (`tests/conftest.py`, `tests/factories.py`).
-- **Dependencies:** none (first sub-phase). External: a local Docker installation.
-- **Acceptance criteria:** `pytest -v` passes for every foundation test file (~25 tests) with
-  zero failures; `alembic upgrade head` succeeds against a freshly-recreated empty schema;
-  `docker compose up -d postgres` runs a healthy container.
-
-#### 1b — LangGraph Trip Search Flow (5 days)
-
-- **Objective:** the pipeline from a raw user message through a ranked, itinerary-attached
-  shortlist — `collect_trip_request`, `search_flights_and_hotels`, `recommend_options`,
-  `generate_itinerary`.
-- **Deliverables:** four node implementations under `app/graph/nodes/`; one test file per node.
-- **Dependencies:** 1a complete.
-- **Acceptance criteria:** all four node test files pass in isolation against fakes; numeric
-  data (price/time/rating) shown in `recommend_options`'s output is asserted to be untouched
-  from the typed shortlist, never regenerated by the LLM.
-
-#### 1c — Selection and Interrupts (3 days)
-
-- **Objective:** the first `interrupt()` gate (`await_selection`) and the node that
-  regenerates the itinerary against the traveler's actual choice (`finalize_itinerary`).
-- **Deliverables:** two node implementations; two test files.
-- **Dependencies:** 1b complete.
-- **Acceptance criteria:** `await_selection` correctly pauses and resumes with a selection
-  payload (verified via monkeypatched `interrupt()`); `finalize_itinerary` incorporates the
-  selected flight/hotel data into the itinerary output.
-
-#### 1d — Traveler PII and Booking Form (5 days)
-
-- **Objective:** the three most safety-sensitive nodes — collecting and encrypting traveler
-  PII (`collect_traveler_details`), filling the booking form once per leg with no blind retry
-  (`fill_booking_form`), and the second `interrupt()` gate where a human reviews the filled
-  form before anything downstream happens (`human_review_gate`).
-- **Deliverables:** three node implementations; three test files.
-- **Dependencies:** 1c complete.
-- **Acceptance criteria:** a test asserts the node's return value contains **only**
-  `traveler_details_id`, never raw name/DOB/passport fields (spec §6.1); a test confirms
-  `fill_booking_form` does not retry on failure and instead sets `form_fill_failed`; a test
-  confirms `human_review_gate` sets `rejection_reason` correctly for both reject reasons.
-
-#### 1e — Email, CRM, Idempotency (3 days)
-
-- **Objective:** the two downstream side-effect nodes that run after human approval —
-  `send_confirmation_email` and `update_crm` — both idempotent.
-- **Deliverables:** two node implementations; two test files.
-- **Dependencies:** 1d complete.
-- **Acceptance criteria:** a test proves calling either node twice with the same
-  `trip_request_id` results in exactly one email sent / one CRM record created, not two.
-
-#### 1f — Graph Assembly, FastAPI, and Full Verification (7 days)
-
-- **Objective:** the `agent_error` node; full `StateGraph` assembly with conditional routing;
-  persistence/crash-recovery verification; PII-non-leakage verification; the FastAPI HTTP
-  layer; full Phase 1 suite verification.
-- **Deliverables:** `app/graph/build.py`; `app/api/`; end-to-end/persistence/PII-leak/API test
-  files.
-- **Dependencies:** 1a-1e complete (this sub-phase wires together every node built so far).
-- **Acceptance criteria (all must hold):**
-  - A happy-path `graph.invoke()` sequence (trip request → both interrupts resumed → approval)
-    ends with `approval_status == "approved"`, `email_status == "sent"`,
-    `crm_status == "created"`.
-  - A reject-at-review-gate sequence with `rejection_reason == "wrong_selection"` correctly
-    routes back to `await_selection` and completes on a second resume.
-  - Resuming a graph via a brand-new checkpointer connection (simulating a process restart)
-    continues correctly from the last checkpoint.
-  - A synthetic passport value planted in a test run is asserted absent, verbatim, from every
-    persisted checkpoint row, from `error_log`, and from the final state dump.
-  - The full Phase 1 `pytest` suite (all six sub-phases, ~60+ tests) passes with zero
-    failures, and no test file references a live third-party API host.
+- Never store traveler PII (passport/ID number, DOB) directly on LangGraph graph state — only
+  a `traveler_details_id` foreign key (spec §5.3, §6.1).
+- `error_log` entries are sanitized `{code, message}` pairs only — never PII, tokens, API keys,
+  or raw upstream responses (spec §5.3).
+- All MCP-tool-calling and LLM-calling nodes get bounded retries (3 attempts, exponential
+  backoff) before routing to `agent_error` (spec §5.2, §7) — except `fill_booking_form`, which
+  deliberately never retries.
+- `send_confirmation_email` and `update_crm` are idempotent via a stored idempotency key
+  derived from the trip/session ID (spec §7).
+- Traveler PII columns (passport/ID number, DOB) are encrypted at the application layer before
+  insert; the key is never a plaintext env var in real deployments (spec §6.1).
+- `human_review_gate` covers **all legs** of a multi-leg trip in one combined decision;
+  `fill_booking_form` loops once per leg (spec §5.2, nodes 8-9).
+- `rejection_reason` is one of `wrong_selection` | `wrong_traveler_details` and drives
+  reject-routing (spec §5.2, node 9).
+- The mock booking site has no payment field or endpoint anywhere in its codebase — a
+  structural absence, not a policy the agent is trusted to follow (spec §6.5).
 
 ---
 
-### Phase 2 — Real Integrations & Mock Booking Site (4 weeks)
+## 3. Phase 1 — Core Agent Logic
 
-- **Objective:** replace fakes with real, sandboxed integrations — custom MCP servers for
-  Amadeus, Gmail, and HubSpot; the official Playwright MCP server (pinned build); a
-  purpose-built mock booking site with no payment field or endpoint anywhere in its code.
-  Everything still runs locally via Docker Compose.
-- **Deliverables:** `mcp-servers/amadeus/`, `mcp-servers/gmail/`, `mcp-servers/hubspot/`
-  (custom MCP servers implementing the `FlightHotelSearchTool`/`EmailTool`/`CRMTool` protocols
-  from Phase 1); a pinned Playwright MCP server build implementing `BookingFormTool`;
-  `mock-booking-site/` (a small web app: traveler-detail form, seat/room extras, a "Proceed to
-  Payment" screen with no functioning control behind it); Playwright automation tests against
-  the real mock site; a `docker-compose.yml` extension wiring all of this together.
-- **Dependencies:** Phase 1 complete (real implementations must satisfy the same `Protocol`
-  interfaces the fakes did — no node code changes). External: an Amadeus for Developers
-  sandbox account/API key, a Gmail account with API access enabled (OAuth2 client, "Testing"
-  publishing status), a HubSpot free-tier account/API key.
-- **Acceptance criteria:** the full conversational flow (identical to Phase 1's end-to-end
-  test) runs against real sandboxed APIs instead of fakes and completes successfully; a
-  Playwright test confirms automation stops at the pre-payment screen on every leg of a
-  multi-leg booking; a test confirms the mock site's codebase contains no payment field or
-  endpoint at all; live-sandbox integration tests run as a separate, non-default CI job (per
-  spec §9) so the default suite stays deterministic.
+**Implements:** the LangGraph `StateGraph` (all 12 workflow nodes + `agent_error`), both
+`interrupt()` gates, Postgres persistence (app tables + LangGraph checkpointer), encrypted
+traveler PII, idempotent side effects, sanitized error handling, and a FastAPI HTTP layer —
+tested end to end against fake tool/LLM clients and a real local Postgres.
 
----
+**Tech stack:** Python 3.12, FastAPI, LangGraph + `langgraph-checkpoint-postgres`, SQLAlchemy
+2.0 + Alembic, `psycopg` v3, Pydantic v2, `pydantic-settings`, `cryptography` (AES-GCM),
+`anthropic` SDK, pytest + pytest-asyncio, Docker Compose (local Postgres).
 
-### Phase 3 — Infrastructure Provisioning (3 weeks)
+### 3.1 Sub-Phase 1a — Project Foundation and Database
 
-- **Objective:** Terraform + Packer provision AWS networking and a reusable Kubernetes node
-  AMI; a self-managed Kubernetes cluster (kubeadm) is stood up (control plane via `user_data`,
-  workers retrieving a short-lived join command from AWS SSM Parameter Store); NetworkPolicies
-  and the External Secrets Operator are wired in.
-- **Deliverables:** `infra/terraform/` (VPC, subnets, security groups, EC2 instances, S3
-  backend with native locking); `infra/packer/` (node AMI definition); NetworkPolicy manifests
-  (frontend→backend, backend→{MCP servers, Postgres}, Playwright MCP→mock site only,
-  Postgres←backend only, default-deny elsewhere); External Secrets Operator installation and
-  at least one working `ExternalSecret` pulling from AWS Secrets Manager.
-- **Dependencies:** Phase 2 complete (needed to know exactly which secrets/services must be
-  provisioned for). External: an AWS account with billing enabled, an IAM user/role with
-  sufficient permissions.
-- **Acceptance criteria:** `terraform apply` provisions the full cluster from empty AWS
-  infrastructure; `kubectl get nodes` shows the control plane and all workers `Ready`; a
-  `NetworkPolicy` conformance check confirms Playwright MCP cannot reach Postgres; an
-  `ExternalSecret` resource successfully materializes a Kubernetes Secret sourced from AWS
-  Secrets Manager, with no secret value ever committed to the GitOps repo.
+Every cross-cutting piece of infrastructure the graph's nodes depend on, built before any node
+exists.
 
----
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Project scaffolding | `pyproject.toml`, `app/config.py` (`Settings`), `docker-compose.yml`, `tests/conftest.py` | — | `pytest tests/test_config.py` passes; `docker compose up -d postgres` runs a healthy container. |
+| 2 | Domain models and graph state | `app/models/domain.py` (`TripRequest`, `FlightOption`, `HotelOption`, `Itinerary`, `TravelerDetails`), `app/models/state.py` (`GraphState`, `BookingFormResult`) | Task 1 | Domain model tests pass, including multi-leg `TripRequest` validation and negative-price rejection; `GraphState` accepts a partial-dict update. |
+| 3 | Traveler PII encryption helper | `app/crypto.py` (`encrypt_field`, `decrypt_field`, `generate_test_key`) | Task 1 | Encrypt→decrypt roundtrips; wrong key fails to decrypt; same plaintext produces different ciphertext each call (random nonce). |
+| 4 | Postgres app tables and migrations | `app/models/db_models.py` (ORM models incl. `TravelerDetailRecord`, `IdempotencyRecord`), `app/db.py`, `alembic/` | Tasks 2, 3 | Schema creates from an empty database; FK constraint rejects a traveler row for a nonexistent trip; encrypted columns roundtrip; `alembic upgrade head` applies cleanly to a freshly-recreated empty schema. |
+| 5 | LangGraph Postgres checkpointer | `app/db.py` (`get_checkpointer`) | Task 1 | `checkpointer.setup()` creates the `checkpoints` table. |
+| 6 | Error handling infrastructure | `app/errors.py` (typed exceptions, `with_retries`, `sanitize_error`) | Task 1 | Retry succeeds on a transient failure (sync and async callables) and raises after max attempts; `sanitize_error` never includes raw upstream payload fields. |
+| 7 | Idempotency helper | `app/idempotency.py` (`check_and_reserve`) | Task 4 | First reservation of a key succeeds; a duplicate reservation of the same key is rejected; different keys don't collide. |
+| 8 | Tool client protocol and fakes | `app/tools/protocol.py` (`FlightHotelSearchTool`, `BookingFormTool`, `EmailTool`, `CRMTool`), `app/tools/fake.py` | Tasks 2, 6 | Each fake tool supports a `behavior` flag (`success`/`empty`/`rate_limited`/`failure`) and raises the correct typed exception. |
+| 9 | LLM client wrapper | `app/llm/client.py` (`LLMClient` protocol, `AnthropicLLMClient`), `app/llm/fake.py` | Task 6 | Fake LLM client returns queued responses in order and can simulate a rate-limit error. |
+| 10 | `NodeDeps` bundle and shared test fixtures | `app/graph/deps.py` (`NodeDeps`), `tests/conftest.py` (`db_engine` fixture), `tests/factories.py` (`make_deps`, `make_traveler_record`) | Tasks 4, 8, 9 | Full foundation `pytest` suite (~25 tests) passes with zero failures. |
 
-### Phase 4 — Kubernetes Deployment (1 week)
+### 3.2 Sub-Phase 1b — LangGraph Trip Search Flow
 
-- **Objective:** deploy every application service to the cluster via Kustomize overlays
-  (`dev` first), manually applied to validate manifests before GitOps takes over.
-- **Deliverables:** `k8s/base/` and `k8s/overlays/dev/` Kustomize manifests for every service
-  (frontend, backend, mock booking site, each MCP server, Postgres); namespace layout.
-- **Dependencies:** Phase 3 complete (cluster must exist).
-- **Acceptance criteria:** `kubectl apply -k k8s/overlays/dev` deploys every service
-  successfully; the frontend is reachable and can complete a full conversation end-to-end
-  against the in-cluster backend and MCP servers; `kustomize build` succeeds with no errors for
-  both the `dev` and (still-empty-shell) `prod` overlays.
+The pipeline from a raw user message through a ranked, itinerary-attached shortlist.
 
----
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Node: `collect_trip_request` | `app/graph/nodes/collect_trip_request.py` | 1a complete | Extracts a valid `TripRequest` from a well-formed message; loops via `interrupt()` and re-validates when a required field is reported missing. |
+| 2 | Node: `search_flights_and_hotels` | `app/graph/nodes/search_flights_and_hotels.py` | Task 1 | Populates `flight_result_ids`/`hotel_result_ids`/`shortlist` per leg for a multi-leg trip; sets `no_results: True` when a leg returns nothing (consumed by Phase 1f's routing). |
+| 3 | Node: `recommend_options` | `app/graph/nodes/recommend_options.py` | Task 2 | Narrative text is LLM-generated, but the numeric shortlist data it's shown alongside is returned untouched — never regenerated by the LLM. |
+| 4 | Node: `generate_itinerary` | `app/graph/nodes/generate_itinerary.py` | Task 1 | Produces a preliminary day-by-day itinerary from the trip request (before any flight/hotel is selected). |
 
-### Phase 5 — CI/CD and GitOps (1.5 weeks)
+### 3.3 Sub-Phase 1c — Selection and Interrupts
 
-- **Objective:** a GitHub Actions pipeline (lint → type-check → unit tests → build → push →
-  tag-bump) feeds Argo CD, which becomes the **sole** applier of manifests to the cluster from
-  this point forward.
-- **Deliverables:** `.github/workflows/` CI pipeline; Argo CD installation and an `Application`
-  resource per service; the promotion path (`main` merge auto-updates the `dev` overlay tag;
-  promotion to `prod` is a separate, explicit PR).
-- **Dependencies:** Phase 4 complete (manifests must already exist and be known-good).
-- **Acceptance criteria:** a commit to `main` results in a new image being built, pushed, and
-  its tag updated in the `dev` overlay automatically, with Argo CD syncing the change to the
-  cluster with no manual `kubectl apply`; CI never applies directly to the cluster (verified by
-  inspecting the workflow's permissions/steps).
+The first `interrupt()` gate, and the node that runs immediately after it.
 
----
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Node: `await_selection` | `app/graph/nodes/await_selection.py` | 1b complete | Pauses via `interrupt()`; on resume, sets `selected_flights`/`selected_hotels` from the resume payload. |
+| 2 | Node: `finalize_itinerary` | `app/graph/nodes/finalize_itinerary.py` | Task 1 | Regenerates the itinerary incorporating the actual selected flight arrival times and hotel. |
 
-### Phase 6 — Observability (1.5 weeks)
+### 3.4 Sub-Phase 1d — Traveler PII and Booking Form
 
-- **Objective:** Prometheus and Grafana deployed; application-level metrics instrumented
-  (workflow completions/failures, interrupt counts per gate, retry counts per node, per-node
-  duration, MCP tool call latency, downstream side-effect status); dashboards and lightweight
-  alerting built out.
-- **Deliverables:** Prometheus + Grafana Helm/Kustomize deployment; `postgres_exporter`,
-  `node-exporter`, `kube-state-metrics`; FastAPI backend instrumentation exporting the
-  application-level metrics listed above; Grafana dashboards; Alertmanager rules for high error
-  rate or booking-flow node failures.
-- **Dependencies:** Phase 5 complete (so dashboard/alerting config can itself be deployed via
-  GitOps rather than applied manually).
-- **Acceptance criteria:** Grafana shows live request latency/error-rate, per-node duration,
-  and MCP call success/failure panels populated from real traffic; a test/manual check confirms
-  metrics and traces never contain traveler PII (same sanitization boundary as `error_log`); an
-  alert fires (verified with a synthetic failure injection) when a booking-flow node fails
-  repeatedly.
+The three most safety-sensitive nodes in the graph.
+
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Node: `collect_traveler_details` | `app/graph/nodes/collect_traveler_details.py` | 1c complete | Return value contains **only** `traveler_details_id` — never raw name/DOB/passport fields; the encrypted record is verifiable in Postgres via the encryption helper. |
+| 2 | Node: `fill_booking_form` | `app/graph/nodes/fill_booking_form.py` | Task 1 | Loops once per leg, producing one `booking_form_results` entry per leg; on a tool failure, does **not** retry — sets `form_fill_failed: True` and a sanitized `error_log` entry instead. |
+| 3 | Node: `human_review_gate` | `app/graph/nodes/human_review_gate.py` | Task 2 | Presents all legs in one combined `interrupt()`; on resume, sets `approval_status` and, on rejection, the correct `rejection_reason` for both reject reasons. |
+
+### 3.5 Sub-Phase 1e — Email, CRM, Idempotency
+
+The two downstream side-effect nodes that run after human approval.
+
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Node: `send_confirmation_email` | `app/graph/nodes/send_confirmation_email.py` | 1d complete | Sends once; calling it again with the same `trip_request_id` returns `email_status: "already_sent"` without sending a second email. |
+| 2 | Node: `update_crm` | `app/graph/nodes/update_crm.py` | Task 1 | Creates the contact/trip record once; calling it again with the same `trip_request_id` returns `crm_status: "already_created"` without creating a duplicate. |
+
+### 3.6 Sub-Phase 1f — Graph Assembly, FastAPI, and Full Verification
+
+Wires every node built so far into one graph and exposes it over HTTP.
+
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Node: `agent_error` | `app/graph/nodes/agent_error.py` | 1e complete | Produces a plain-language message with no raw error codes/details. |
+| 2 | Graph assembly | `app/graph/build.py` (`build_graph`, conditional routing) | Task 1 | Happy-path `graph.invoke()` sequence (trip request → both interrupts resumed → approval) ends with `approval_status == "approved"`, `email_status == "sent"`, `crm_status == "created"`; a reject-at-review-gate sequence with `rejection_reason == "wrong_selection"` correctly routes back to `await_selection` and completes on a second resume. |
+| 3 | Persistence and crash-recovery tests | `tests/test_graph_persistence.py` | Task 2 | Resuming via a brand-new checkpointer connection (simulating a process restart) continues correctly from the last checkpoint; an idempotency key correctly prevents a duplicate email/CRM write after a simulated crash between side effect and status persistence. |
+| 4 | PII-leak tests | `tests/test_pii_leak.py` | Task 2 | A synthetic passport value planted in a test run is asserted absent, verbatim, from every persisted checkpoint row, from `error_log`, and from the final state dump. |
+| 5 | FastAPI endpoints | `app/api/main.py`, `app/api/schemas.py` | Task 2 | `POST /conversations` and `POST /conversations/{thread_id}/messages` round-trip a full conversation through both interrupts via HTTP, ending in the same assertions as Task 2. |
+| 6 | Full suite verification | — (verification only) | Tasks 1-5 | Full Phase 1 `pytest` suite (~60+ tests across all sub-phases) passes with zero failures; no test file references a live third-party API host (`grep` check). |
 
 ---
 
-### Phase 7 — Production Validation / Demo (1 week)
+## 4. Phase 2 — Real Integrations & Mock Booking Site
 
-- **Objective:** full end-to-end verification of the complete workflow running on the real AWS
-  Kubernetes environment (`prod` overlay) — both the happy path and the reject-at-review-gate
-  path — with monitoring dashboards and alerts confirmed to reflect live activity during the
-  run.
-- **Deliverables:** a recorded/observed full run against `prod`; a final verification checklist
-  confirming every acceptance criterion from Phases 1-6 still holds in the `prod` environment
-  specifically (some, like AWS IAM/EBS/External Secrets integration, can only be verified here
-  — see spec §9).
-- **Dependencies:** Phases 1-6 complete.
-- **Acceptance criteria:** a complete happy-path conversation (trip request through CRM update)
-  and a complete reject-at-review-gate conversation both run successfully against `prod`;
-  Grafana shows the corresponding metrics/dashboard activity in real time during the run; this
-  is the terminal milestone (M7) and the point at which the project is considered complete.
+**Implements:** replaces every fake tool client from Phase 1 with a real, sandboxed
+implementation of the same `Protocol` interface — no node code changes. Adds the mock booking
+site itself.
+
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Amadeus MCP server | `mcp-servers/amadeus/` implementing `FlightHotelSearchTool` against the Amadeus sandbox API | Phase 1 complete | Contract tests (mocked/recorded responses) pass in default CI; a separate, non-default job exercises the real sandbox. |
+| 2 | Gmail MCP server | `mcp-servers/gmail/` implementing `EmailTool` (OAuth2, "Testing" publishing status) | Phase 1 complete | Mocked send test passes in default CI; a separate job sends a real test email against the sandbox account. |
+| 3 | HubSpot MCP server | `mcp-servers/hubspot/` implementing `CRMTool` | Phase 1 complete | Mocked upsert-contact/create-trip-record tests pass in default CI; a separate job exercises the real free-tier account. |
+| 4 | Playwright MCP integration | Docker image built from Microsoft's official Playwright MCP source, pinned to a specific version/commit, implementing `BookingFormTool` | Phase 1 complete | Image build is reproducible from the pinned reference; no unpinned `latest` tag anywhere in the build. |
+| 5 | Mock booking site | `mock-booking-site/` — traveler-detail form, seat/room extras, a "Proceed to Payment" screen with no functioning control or endpoint behind it | — | Component tests validate the form; a dedicated test asserts the codebase contains no payment field, route, or endpoint anywhere. |
+| 6 | Wire real tool implementations into `NodeDeps` | Update to `app/graph/deps.py` / DI wiring (env-flag or config-driven choice of real vs. fake) | Tasks 1-5 | No changes required to any node file from Phase 1 — only which concrete class is injected changes. |
+| 7 | Playwright automation against the real mock site | End-to-end automation test, single-leg and multi-leg | Tasks 4, 5, 6 | Automation stops at the pre-payment screen on every leg; masked review screenshots contain no raw passport/DOB values. |
+| 8 | Local Docker Compose integration | `docker-compose.yml` extension wiring frontend, backend, all MCP servers, mock site, Postgres | Tasks 1-7 | The full conversational flow (identical assertions to Phase 1f Task 2/5) runs against real sandboxed APIs and the real mock site, completing successfully. |
 
 ---
 
-## 5. Cross-Phase Dependencies
+## 5. Phase 3 — Infrastructure Provisioning
+
+**Implements:** a self-managed Kubernetes cluster on AWS, provisioned entirely by Terraform and
+Packer, with network isolation and secrets management wired in.
+
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Packer node AMI | `infra/packer/` — kubeadm, kubelet, container runtime pre-installed | Phase 2 complete | `packer build` produces a bootable AMI usable by Terraform. |
+| 2 | Terraform AWS networking + state backend | `infra/terraform/` — VPC, subnets, security groups; S3 backend with native locking (`use_lockfile = true`, no DynamoDB table) | Task 1 | `terraform plan`/`apply` provisions networking from empty AWS infrastructure; state locking prevents concurrent applies. |
+| 3 | Terraform cluster instances | EC2 control-plane (1 node) + worker instances from the Task 1 AMI; control plane initializes via `user_data` (`kubeadm init`); workers retrieve a short-lived `kubeadm join` command from AWS SSM Parameter Store at boot | Task 2 | `kubectl get nodes` shows the control plane and all workers `Ready`; no Terraform `remote-exec` is used anywhere. |
+| 4 | NetworkPolicies | Manifests: frontend→backend only; backend→{MCP servers, Postgres}; Playwright MCP→mock site only; Postgres←backend only; default-deny elsewhere | Task 3 | A conformance check confirms Playwright MCP cannot reach Postgres, and the mock site cannot reach anything but Playwright MCP. |
+| 5 | External Secrets Operator | Operator installation + at least one working `ExternalSecret` sourced from AWS Secrets Manager | Task 3 | A Kubernetes Secret materializes from AWS Secrets Manager at runtime; no secret value is ever committed to the GitOps repo (only the `ExternalSecret` reference object is). |
+
+---
+
+## 6. Phase 4 — Kubernetes Deployment
+
+**Implements:** every application service deployed to the cluster via Kustomize, manually
+applied and verified before GitOps (Phase 5) takes over.
+
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Kustomize base manifests | `k8s/base/` — one manifest set per service (frontend, backend, mock booking site, each MCP server, Postgres) | Phase 3 complete | `kustomize build k8s/base` succeeds with no errors. |
+| 2 | `dev` overlay | `k8s/overlays/dev/` | Task 1 | `kubectl apply -k k8s/overlays/dev` deploys every service successfully. |
+| 3 | Manual deployment verification | — (verification only) | Task 2 | The frontend is reachable and completes a full conversation end-to-end against the in-cluster backend and MCP servers. |
+| 4 | `prod` overlay scaffold | `k8s/overlays/prod/` (parameterized, not yet driving real traffic) | Task 1 | `kustomize build k8s/overlays/prod` succeeds with no errors. |
+
+---
+
+## 7. Phase 5 — CI/CD and GitOps
+
+**Implements:** a CI pipeline that builds and tags images, and Argo CD as the sole applier of
+manifests to the cluster from this point forward.
+
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | GitHub Actions pipeline | `.github/workflows/` — lint → type-check → unit tests → build → push to registry | Phase 4 complete | A commit to `main` triggers the pipeline and produces a pushed image, gated on all checks passing. |
+| 2 | Automatic `dev` tag bump | CI step updating the `dev` overlay's image tag | Task 1 | A successful pipeline run updates the `dev` overlay's manifest tag automatically, with no manual edit. |
+| 3 | Argo CD installation | Argo CD deployed to the cluster; an `Application` resource per service | Phase 4 complete | Argo CD syncs the `dev` overlay's current manifests to the cluster with no manual `kubectl apply`. |
+| 4 | `dev` → `prod` promotion path | A separate, explicit PR-based process for bumping the `prod` overlay's tag | Tasks 2, 3 | Promoting to `prod` requires an explicit PR merge — never automatic, never via CI applying directly to the cluster. |
+
+---
+
+## 8. Phase 6 — Observability
+
+**Implements:** Prometheus/Grafana plus application-level metrics giving visibility into both
+infrastructure and the agent's own workflow behavior.
+
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Prometheus + Grafana deployment | Kustomize/Helm manifests, deployed via the Phase 5 GitOps path | Phase 5 complete | Prometheus is scraping targets; Grafana is reachable and connected to it as a data source. |
+| 2 | Infrastructure exporters | `postgres_exporter`, `node-exporter`, `kube-state-metrics` | Task 1 | Each exporter's metrics are visible in Prometheus. |
+| 3 | Application-level metrics instrumentation | FastAPI backend exports: workflow completions/failures, interrupt counts per gate, retry counts per node, per-node duration, MCP tool call latency, downstream side-effect status | Task 1 | Metrics appear in Prometheus during a live conversation run; a check confirms metrics/traces never contain traveler PII (same sanitization boundary as `error_log`). |
+| 4 | Grafana dashboards | Dashboards for request latency/error rate, per-node duration, MCP call success/failure rate, cluster health | Tasks 2, 3 | Dashboards populate from real traffic during a test conversation. |
+| 5 | Alerting rules | Alertmanager rules for high error rate or repeated booking-flow node failures | Task 3 | A synthetic failure injection triggers the corresponding alert. |
+
+---
+
+## 9. Phase 7 — Production Validation / Demo
+
+**Implements:** final end-to-end verification of the complete workflow against the real AWS
+`prod` environment.
+
+| # | Task | Files/Outputs | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| 1 | Deploy `prod` overlay | `prod` overlay live via Argo CD | Phases 1-6 complete | All services running in the `prod` namespace/overlay, `Ready`. |
+| 2 | Happy-path production run | — (verification only) | Task 1 | A complete conversation (trip request through CRM update) runs successfully against `prod`. |
+| 3 | Reject-at-review-gate production run | — (verification only) | Task 1 | A complete conversation that rejects at `human_review_gate` and completes on retry runs successfully against `prod`. |
+| 4 | Dashboard/alert verification | — (verification only) | Tasks 2, 3 | Grafana shows the corresponding metrics/dashboard activity in real time during both runs. |
+| 5 | AWS-specific integration verification | — (verification only) | Task 1 | IAM, EBS, and External Secrets Operator ↔ Secrets Manager integration — which cannot be verified in `kind` (spec §9) — are confirmed working in the real AWS environment. |
+
+---
+
+## 10. Cross-Phase Dependencies
 
 **Sequencing:** phases run strictly in order — 1a→1b→1c→1d→1e→1f→2→3→4→5→6→7. None are
-parallelizable; each assumes every prior phase is committed and passing (see §4 per-phase
-Dependencies for the specific reason in each case).
+parallelizable; each assumes every prior phase's tests pass (see each phase's task table for
+the specific reason in each case).
 
-**External accounts/services needed, and by when:**
+**External accounts/services required:**
 
-| Needed by | Account/service | Purpose |
+| Account/service | Required starting | Purpose |
 |---|---|---|
-| Phase 2 | Amadeus for Developers (sandbox) | Flight/hotel search |
-| Phase 2 | Gmail account + OAuth2 client (Testing mode) | Confirmation email sending |
-| Phase 2 | HubSpot (free tier) | CRM contact/trip records |
-| Phase 3 | AWS account with billing enabled | EC2, VPC, S3 (Terraform state), Secrets Manager |
-| Phase 3 | AWS IAM user/role | Terraform provisioning permissions |
-| Phase 5 | Container registry (e.g. ECR) | CI image push target |
-
-Setting these up is not assumed instantaneous — see §6.
+| Amadeus for Developers (sandbox) | Phase 2 | Flight/hotel search |
+| Gmail account + OAuth2 client (Testing mode) | Phase 2 | Confirmation email sending |
+| HubSpot (free tier) | Phase 2 | CRM contact/trip records |
+| AWS account with billing enabled | Phase 3 | EC2, VPC, S3 (Terraform state), Secrets Manager |
+| AWS IAM user/role | Phase 3 | Terraform provisioning permissions |
+| Container registry (e.g. ECR) | Phase 5 | CI image push target |
 
 ---
 
-## 6. Schedule Risks
+## 11. How Later Phases Get Detailed Further
 
-Full technical risk register is in `spec.md` §10; the subset most likely to affect **this
-timeline** specifically:
-
-- **Third-party account/OAuth setup friction** (Gmail's OAuth consent-screen requirements,
-  Amadeus sandbox provisioning) could delay the start of Phase 2 — mitigated by starting
-  account setup in parallel with the tail end of Phase 1, not waiting until Phase 2 begins.
-- **kubeadm/Packer/SSM bootstrap complexity** (Phase 3) is nontrivial compared to a managed
-  EKS setup — if it stalls past the 3-week estimate, the documented fallback is a temporary
-  `kind` cluster to keep Phase 4 unblocked while infrastructure work continues in parallel.
-- **Scope creep across many subsystems** is the single biggest risk to the overall 18-week
-  estimate — mitigated by the phase structure itself: each phase ships working, independently
-  verifiable software, so a slip in one phase doesn't block demonstrating progress on the
-  ones before it.
-
----
-
-## 7. How This Plan Is Maintained
-
-Phase 1's six sub-plans (`docs/plans/01-*.md` through `docs/plans/06-*.md`) already contain
-full bite-sized TDD detail and are ready to execute. Phases 2-7 do not have detailed sub-plans
-yet, by design — each will be written via the same planning process immediately before that
-phase starts, so it reflects what was actually learned building the prior phases rather than
-an upfront guess. When each phase's detailed sub-plan is written, a link will be added to the
-corresponding section in §4 above; the objectives, deliverables, dependencies, and acceptance
-criteria in this document should remain accurate regardless, since they describe outcomes
-rather than implementation steps.
+Phase 1's task tables above are implementation-ready. Phases 2-7 are specified at the same
+task granularity but will be refined with concrete sub-tasks (files, exact commands, test
+code) immediately before each phase starts, so the detail reflects what was actually built in
+the prior phases rather than an upfront guess — the objectives, task ordering, dependencies,
+and acceptance criteria in this document are expected to remain accurate regardless, since
+they describe required outcomes, not incidental implementation choices.
