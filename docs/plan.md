@@ -1,7 +1,6 @@
 # AI Travel Planning and Booking Agent Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
+> **Implementation instructions:** Implement the project by following this plan step by step. Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to execute each task, and track progress using Markdown checkboxes (- [ ]).
 **Goal:** Build an AI travel agent that plans and books a multi-leg trip end to end — searches flights/hotels, builds an itinerary, fills a mock booking form, stops for human approval, emails the confirmation, and logs the trip to a CRM.
 
 **Architecture:** A React chat frontend talks to a FastAPI backend hosting a LangGraph agent. The agent calls four MCP servers (Amadeus for search, Playwright for browser automation, Gmail for email, HubSpot for CRM). Persistence is environment-based behind two abstraction interfaces — a checkpoint-storage interface (LangGraph's own `BaseCheckpointSaver`) and an application-repository interface — so the graph and business logic never depend on a concrete database. Local development and tests run entirely on SQLite (both interfaces); production swaps in DynamoDB for checkpoints and PostgreSQL for application data, with no changes to node or repository-calling code. The stack deploys to a self-managed Kubernetes cluster on AWS EC2 via Terraform/Packer, with Argo CD GitOps and Prometheus/Grafana observability.
