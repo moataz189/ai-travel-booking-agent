@@ -53,7 +53,8 @@ This is a capstone/portfolio project. It is intended to demonstrate, end to end 
 | React chat frontend | Conversational UI for trip input, option selection, and the pre-submit review screen. Talks to backend over REST + SSE/WebSocket for streamed agent responses. |
 | FastAPI backend | Hosts the LangGraph agent graph; exposes endpoints for starting a conversation, sending messages, submitting selections, and approving/rejecting the booking-review gate. In `prod`, requires a shared-secret access code on every request (Section 6.6) — not user auth, a cost/abuse gate. |
 | LangGraph StateGraph | The orchestrator: fixed nodes, conditional edges, `interrupt()`-based human gates. |
-| Postgres | LangGraph checkpointer (conversation/graph state) **plus** application tables (trip requests, search results, traveler details, booking status). System of record. |
+| Postgres | Application tables (trip requests, search results, encrypted traveler details, booking status, idempotency records). System of record for all application data. |
+| DynamoDB | Backs the LangGraph checkpointer only (conversation/graph state). The only AWS-native piece of the persistence layer — chosen to demonstrate a non-relational, AWS-managed checkpoint store; every other table lives in Postgres. |
 | Amadeus MCP server (custom) | `search_flights`, `search_hotels` tools wrapping the Amadeus self-service API (sandbox environment). |
 | Playwright MCP server (Microsoft, self-built & pinned) | Browser automation to fill the mock booking site. No database or secret access. |
 | Gmail MCP server (custom) | `send_email` tool (OAuth2) for the final itinerary/confirmation email. |
@@ -71,7 +72,7 @@ LangGraph node code uniform.
 ```
 User (React chat) ⇄ FastAPI ⇄ LangGraph agent ⇄ [Amadeus MCP, Playwright MCP, Gmail MCP, HubSpot MCP]
                                      │
-                                 Postgres (state + app data)
+                        DynamoDB (checkpoint state) + Postgres (app data)
 ```
 
 ### 4.3 MCP Servers and Tool Contracts
@@ -318,10 +319,10 @@ OAuth tokens, API keys, or raw third-party responses.
 
 ### 6.1 Sensitive Data Handling
 
-LangGraph's Postgres checkpointer persists a snapshot of the full graph state after every
-node, across multiple checkpoint rows (one per superstep). This means sensitive fields placed
-directly on graph state would be written into Postgres multiple times, not avoided by being
-"only in state." The design instead is:
+LangGraph's DynamoDB-backed checkpointer persists a snapshot of the full graph state after
+every node, across multiple checkpoint items (one per superstep). This means sensitive fields
+placed directly on graph state would be written into DynamoDB multiple times, not avoided by
+being "only in state." The design instead is:
 
 - Traveler details (including passport/ID) are written to a dedicated `traveler_details`
   table, not onto the graph state object.
@@ -346,6 +347,9 @@ directly on graph state would be written into Postgres multiple times, not avoid
 - All secrets (Amadeus API key, Gmail OAuth client/token, HubSpot API key, DB encryption key,
   Postgres credentials) live in Kubernetes Secrets, created at runtime by the **External
   Secrets Operator** from **AWS Secrets Manager**.
+- The backend's access to the DynamoDB checkpoint table is **not** a Secrets Manager credential
+  — it is granted via an IAM role scoped to that one table (read/write only), following the
+  same least-privilege principle through a different AWS-native mechanism.
 - Argo CD's GitOps repository contains only `ExternalSecret` reference objects — never secret
   values.
 - Each MCP server receives only the credentials it needs (e.g. Playwright MCP gets zero
@@ -362,6 +366,8 @@ resources are required:
 - Postgres accepts ingress from the backend only.
 - Every MCP server has a default-deny policy with only its required ingress/egress explicitly
   opened.
+- The backend's access to the DynamoDB checkpoint table is over the AWS API, not in-cluster
+  traffic, so it is governed by the IAM role in 6.2, not by a `NetworkPolicy`.
 
 ### 6.4 Prompt Injection
 
@@ -421,7 +427,11 @@ for convenience during local iteration; the `prod` overlay must not.
 - **Terraform** provisions AWS networking (VPC, subnets, security groups) and EC2 instances for
   a self-managed Kubernetes cluster (1 control-plane node + N worker nodes). Remote state uses
   an S3 backend with native locking (`use_lockfile = true`, Terraform ≥1.10) — no DynamoDB lock
-  table (DynamoDB-based locking is deprecated).
+  table (DynamoDB-based *locking* is deprecated; this is unrelated to the application's own
+  DynamoDB checkpoint table below, which Terraform also provisions).
+- **Terraform** also provisions the DynamoDB table backing the LangGraph checkpointer (4.1,
+  6.1), one per environment, with `PAY_PER_REQUEST` billing, server-side encryption, and TTL so
+  old conversations expire automatically.
 - **Packer** builds a reusable Kubernetes node AMI (kubeadm, kubelet, container runtime
   pre-installed).
 - The control-plane node initializes via EC2 `user_data` running `kubeadm init`. Worker nodes
@@ -467,7 +477,9 @@ official Playwright MCP source, pinned to a specific version/commit** — never 
 ### 8.5 Observability
 
 - Prometheus scrapes the backend (FastAPI instrumentation), Postgres (`postgres_exporter`), and
-  cluster/node metrics (`node-exporter`, `kube-state-metrics`).
+  cluster/node metrics (`node-exporter`, `kube-state-metrics`). The DynamoDB checkpoint table's
+  own metrics (consumed capacity, throttled requests, latency) are pulled from CloudWatch,
+  since DynamoDB is an AWS-managed service, not scraped in-cluster.
 - **Application-level metrics** (separate from infra metrics): workflow completions, workflow
   failures, interrupt counts (per gate), retry counts (per node), per-node duration, MCP tool
   call latency (per server), and downstream side-effect status (email/CRM success/failure).
@@ -502,6 +514,9 @@ official Playwright MCP source, pinned to a specific version/commit** — never 
   additional safeguard, not the primary check.
 - **Postgres tests**: migrations from an empty database, foreign-key constraints, encrypted-
   column round-trip correctness, and retention/purge job behavior.
+- **DynamoDB checkpointer tests**: checkpoint-item creation and round-trip against a local
+  DynamoDB endpoint or a mocked AWS SDK, kept out of the live-third-party-API restriction above
+  since it's the application's own persistence layer, not an external service.
 - **Playwright/mock-site tests**: component tests for the mock site's form validation; a
   Playwright suite runs the fill flow headless in CI against a running instance, including a
   multi-leg case (asserting the per-leg loop produces one filled-form summary per leg and the
@@ -546,9 +561,9 @@ official Playwright MCP source, pinned to a specific version/commit** — never 
 
 ## 11. Roadmap (Implementation Phases)
 
-1. **Local development — core agent logic.** LangGraph agent + mocked MCP tools + Postgres,
-   no infra. Proves the workflow logic, both `interrupt()` gates, and retry/error handling work
-   correctly in isolation.
+1. **Local development — core agent logic.** LangGraph agent + mocked MCP tools + Postgres
+   (application data) + local DynamoDB (checkpointer), no infra. Proves the workflow logic,
+   both `interrupt()` gates, and retry/error handling work correctly in isolation.
 2. **Local development — real integrations.** Real MCP servers (Amadeus, Gmail, HubSpot,
    Playwright) wired in against sandboxes; mock booking site built and automated end-to-end.
    Still running locally/Docker Compose.
