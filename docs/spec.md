@@ -51,7 +51,7 @@ This is a capstone/portfolio project. It is intended to demonstrate, end to end 
 | Component | Role |
 |---|---|
 | React chat frontend | Conversational UI for trip input, option selection, and the pre-submit review screen. Talks to backend over REST + SSE/WebSocket for streamed agent responses. |
-| FastAPI backend | Hosts the LangGraph agent graph; exposes endpoints for starting a conversation, sending messages, submitting selections, and approving/rejecting the booking-review gate. |
+| FastAPI backend | Hosts the LangGraph agent graph; exposes endpoints for starting a conversation, sending messages, submitting selections, and approving/rejecting the booking-review gate. In `prod`, requires a shared-secret access code on every request (Section 6.6) — not user auth, a cost/abuse gate. |
 | LangGraph StateGraph | The orchestrator: fixed nodes, conditional edges, `interrupt()`-based human gates. |
 | Postgres | LangGraph checkpointer (conversation/graph state) **plus** application tables (trip requests, search results, traveler details, booking status). System of record. |
 | Amadeus MCP server (custom) | `search_flights`, `search_hotels` tools wrapping the Amadeus self-service API (sandbox environment). |
@@ -94,7 +94,9 @@ prevents the model from choosing to skip it.
 2. **`search_flights_and_hotels`** — Calls Amadeus MCP tools (parallel flight + hotel search per
    leg). Full results are written to application tables (not graph state) to avoid checkpoint
    bloat; graph state holds result IDs and, optionally, a small shortlist. Empty results route
-   to a `no_results` branch that asks the user to relax constraints rather than dead-ending.
+   to a `no_results` branch that asks the user to relax constraints (dates/budget/destination)
+   and then loops back to `collect_trip_request` with those fields marked for re-entry, rather
+   than dead-ending.
 3. **`recommend_options`** — Ranks/filters to a shortlist (top 3–5 per leg) within budget.
    Numeric/factual fields (price, times, stops) are rendered directly from typed data; the LLM
    only narrates around fixed facts, so it cannot misrepresent them.
@@ -107,21 +109,29 @@ prevents the model from choosing to skip it.
 7. **`collect_traveler_details`** — Gathers per-traveler details required by the mock site's
    form. Writes to a dedicated, encrypted `traveler_details` Postgres table; graph state holds
    only a `traveler_details_id` foreign key, never the raw values (see Section 6.1).
-8. **`fill_booking_form`** — The **backend node** (not the Playwright MCP server) fetches and
-   decrypts the traveler record just-in-time, then passes the required plaintext values to the
-   Playwright MCP tool call in memory only. Playwright fills the mock site's form and stops at
-   the page showing a filled summary immediately before the "Proceed to Payment" button.
-   Passport/ID number and DOB fields are masked before a review screenshot is captured.
-9. **`human_review_gate`** *(interrupt)* — Presents the masked filled-form summary/screenshot in
-   the review UI. Waits for explicit **Approve** or **Reject**. This gate approves the filled
-   mock form and the downstream notification/CRM actions — **not a real booking or payment**,
-   neither of which exist in this system. Reject routes back to `collect_traveler_details` or
-   `await_selection` depending on the stated reason.
+8. **`fill_booking_form`** — The mock booking site models a single flight+hotel transaction, so
+   for a multi-leg trip this node **loops once per leg**: the **backend node** (not the
+   Playwright MCP server) fetches and decrypts the traveler record just-in-time for that leg,
+   passes the required plaintext values to the Playwright MCP tool call in memory only, and
+   Playwright fills that leg's form, stopping at the page showing a filled summary immediately
+   before the "Proceed to Payment" button. Passport/ID number and DOB fields are masked before a
+   review screenshot is captured for each leg. The loop produces one filled-form summary per
+   leg, collected into `booking_form_results` (a list, not a single value).
+9. **`human_review_gate`** *(interrupt)* — Presents **all legs' masked filled-form summaries
+   together** in a single combined review screen. Waits for one explicit **Approve** or
+   **Reject** decision covering the whole trip (not a per-leg approval — this keeps the mock
+   site simple and avoids forcing the user through N separate approval clicks). This gate
+   approves the filled mock forms and the downstream notification/CRM actions — **not a real
+   booking or payment**, neither of which exist in this system. On reject, the user's stated
+   `rejection_reason` (an enum: `wrong_selection` or `wrong_traveler_details`) determines the
+   routing: `wrong_selection` routes back to `await_selection` (and re-runs `finalize_itinerary`
+   and the `fill_booking_form` loop for all legs); `wrong_traveler_details` routes back to
+   `collect_traveler_details` (and re-runs the `fill_booking_form` loop only).
 10. **`send_confirmation_email`** — On approval, Gmail MCP sends the final itinerary + trip
-    summary (not a payment receipt — none exists). Carries an idempotency key so retries can't
-    double-send.
-11. **`update_crm`** — HubSpot MCP upserts the contact and creates a trip/deal record. Also
-    carries an idempotency key so retries can't create duplicate records.
+    summary covering all legs (not a payment receipt — none exists). Carries an idempotency key
+    so retries can't double-send.
+11. **`update_crm`** — HubSpot MCP upserts the contact and creates a trip/deal record covering
+    the whole trip. Also carries an idempotency key so retries can't create duplicate records.
 12. **`end`** — Terminal state; conversation summary shown to user.
 
 Each MCP-tool-calling node (2, 8, 10, 11) has a bounded-retry edge (3 attempts, exponential
@@ -130,12 +140,19 @@ user. `fill_booking_form` failures do not retry blindly — they route to a dedi
 state with an explicit retry/abort choice, since silently retrying a form-fill is riskier than
 retrying a search.
 
+Nodes 1, 3, 4, and 6 (`collect_trip_request`, `recommend_options`, `generate_itinerary`,
+`finalize_itinerary`) call the Claude API directly rather than through an MCP tool, and are
+subject to the same class of failures (timeouts, rate limits, transient API errors). These get
+the same bounded-retry-then-`agent_error` treatment as the MCP-tool-calling nodes, mapped to
+their own sanitized error codes (e.g. `LLMTimeoutError`, `LLMRateLimitError`).
+
 ### 5.3 State Schema (top-level fields)
 
 `trip_request`, `flight_result_ids` / shortlist, `hotel_result_ids` / shortlist, `itinerary`,
 `selected_flights`, `selected_hotels`, `traveler_details_id` (FK, not raw data),
-`booking_form_result`, `approval_status`, `email_status` (with idempotency key),
-`crm_status` (with idempotency key), `retry_counts`, `error_log`.
+`booking_form_results` (list, one per leg), `approval_status`, `rejection_reason`
+(enum: `wrong_selection` | `wrong_traveler_details`, set only on reject), `email_status` (with
+idempotency key), `crm_status` (with idempotency key), `retry_counts`, `error_log`.
 
 `error_log` is explicitly typed as sanitized `{code, message}` pairs only — never traveler PII,
 OAuth tokens, API keys, or raw third-party responses.
@@ -209,12 +226,25 @@ The mock booking site has no payment form field or payment endpoint anywhere in 
 this is a structural absence, not a policy the agent is trusted to follow. Playwright cannot
 navigate beyond the review screen because no route or control exists to do so.
 
+### 6.6 Public Endpoint Access Gate
+
+V1 has no user authentication (Section 3), but the `prod` deployment is internet-reachable and
+sits in front of billed third-party APIs (Claude, Amadeus, Gmail, HubSpot). Without any gate,
+random internet traffic could run up API costs or trigger real email sends/CRM writes. This is
+not user authentication — it's a single shared-secret access gate: the FastAPI backend requires
+a pre-shared access code (a header or query param, sourced from the same Secrets Manager/
+External Secrets Operator flow as other credentials) on every request, rejecting anything
+without it before any LLM or MCP tool call is made. The `dev` overlay may run without this gate
+for convenience during local iteration; the `prod` overlay must not.
+
 ## 7. Error Handling
 
 - Every MCP tool call is wrapped with typed exceptions (e.g. `AmadeusRateLimitError`,
-  `PlaywrightTimeoutError`, `GmailSendError`) mapped to sanitized `error_log` codes.
+  `PlaywrightTimeoutError`, `GmailSendError`) mapped to sanitized `error_log` codes. Direct
+  Claude API calls (nodes 1, 3, 4, 6) get the same treatment (e.g. `LLMTimeoutError`,
+  `LLMRateLimitError`).
 - Bounded retries (3x, exponential backoff) for transient failures (rate limits, timeouts) on
-  search, email, and CRM nodes.
+  search, LLM, email, and CRM nodes.
 - `fill_booking_form` failures route to a dedicated failure state with an explicit retry/abort
   choice rather than retrying automatically.
 - Partial-failure handling post-approval: if email succeeds but CRM fails (or vice versa), the
@@ -271,6 +301,11 @@ official Playwright MCP source, pinned to a specific version/commit** — never 
   updating the relevant image tag in the appropriate `k8s/overlays/*` manifest.
 - **Argo CD is the sole component that applies manifests to the cluster.** CI never applies
   directly.
+- **Promotion path**: a merge to `main` updates the `dev` overlay's image tag automatically.
+  Promotion from `dev` to `prod` is a separate, explicit action (a PR that updates the `prod`
+  overlay's tag) rather than automatic — since this is a demo project, prod promotion is
+  manually triggered once `dev` has been visually verified, not gated on an automated
+  approval pipeline.
 
 ### 8.5 Observability
 
@@ -298,8 +333,9 @@ official Playwright MCP source, pinned to a specific version/commit** — never 
   schedule, or gated on required secrets being present — keeping normal CI deterministic.
 - **LangGraph persistence tests**: for both `interrupt()` gates (`await_selection`,
   `human_review_gate`) — checkpoint creation, resume behavior after a simulated process
-  restart, correct Approve/Reject routing, and prevention of duplicated downstream actions on
-  resume.
+  restart, correct Approve/Reject routing for both `rejection_reason` values
+  (`wrong_selection` and `wrong_traveler_details`), and prevention of duplicated downstream
+  actions on resume.
 - **Crash-recovery tests**: a side effect (email/CRM) succeeds but the process crashes before
   its status is persisted; on resume, the idempotency key must prevent a duplicate email or
   duplicate CRM record.
@@ -310,10 +346,12 @@ official Playwright MCP source, pinned to a specific version/commit** — never 
 - **Postgres tests**: migrations from an empty database, foreign-key constraints, encrypted-
   column round-trip correctness, and retention/purge job behavior.
 - **Playwright/mock-site tests**: component tests for the mock site's form validation; a
-  Playwright suite runs the fill flow headless in CI against a running instance, asserting the
-  flow stops at the pre-payment screen, that masked screenshots contain no raw PII, and that
-  **no route or control exists to navigate past the review screen** (there is no payment field
-  or endpoint to reach in the first place).
+  Playwright suite runs the fill flow headless in CI against a running instance, including a
+  multi-leg case (asserting the per-leg loop produces one filled-form summary per leg and the
+  combined review screen shows all of them together), asserting the flow stops at the
+  pre-payment screen on every leg, that masked screenshots contain no raw PII, and that **no
+  route or control exists to navigate past the review screen** (there is no payment field or
+  endpoint to reach in the first place).
 - **Security tests**: NetworkPolicy assertions (e.g. verifying Playwright MCP cannot reach
   Postgres).
 - **Infra tests**: `terraform validate`/`plan` in CI on every infra PR; `kustomize build`
@@ -334,6 +372,8 @@ official Playwright MCP source, pinned to a specific version/commit** — never 
 | Single control-plane node is a single point of failure | Explicitly documented as acceptable for a demo (Section 8.1); not a hidden gap. |
 | Scope creep across many subsystems risks an unfinished demo | Explicit phased roadmap below — a thin vertical slice ships before infra polish. |
 | kubeadm/Packer/SSM bootstrap complexity is nontrivial | More infra work than managed EKS; budgeted as its own milestone, with a `kind`-cluster fallback if it stalls. |
+| Public `prod` backend sits in front of billed third-party APIs with no user auth | Section 6.6 access gate (shared secret) required on `prod`; `dev` may run without it. |
+| Third-party account/OAuth setup friction (e.g. Gmail API sending scope requiring OAuth consent-screen verification or staying in "Testing" mode with a fixed test-user list; Amadeus production-tier access review) | Budget setup time as its own early task, not assumed instantaneous; design targets each provider's free/sandbox tier, which does not require production approval. |
 
 ### Alternatives Considered
 
