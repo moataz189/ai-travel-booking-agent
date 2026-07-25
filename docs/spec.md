@@ -53,8 +53,7 @@ This is a capstone/portfolio project. It is intended to demonstrate, end to end 
 | React chat frontend | Conversational UI for trip input, option selection, and the pre-submit review screen. Talks to backend over REST + SSE/WebSocket for streamed agent responses. |
 | FastAPI backend | Hosts the LangGraph agent graph; exposes endpoints for starting a conversation, sending messages, submitting selections, and approving/rejecting the booking-review gate. In `prod`, requires a shared-secret access code on every request (Section 6.6) — not user auth, a cost/abuse gate. |
 | LangGraph StateGraph | The orchestrator: fixed nodes, conditional edges, `interrupt()`-based human gates. |
-| Postgres | Application tables (trip requests, search results, encrypted traveler details, booking status, idempotency records). System of record for all application data. |
-| DynamoDB | Backs the LangGraph checkpointer only (conversation/graph state). The only AWS-native piece of the persistence layer — chosen to demonstrate a non-relational, AWS-managed checkpoint store; every other table lives in Postgres. |
+| Persistence abstraction | Two interfaces the graph and business logic depend on exclusively — a checkpoint-storage interface (LangGraph's `BaseCheckpointSaver`) and an `ApplicationRepository` interface — with environment-selected concrete adapters. See 4.4. |
 | Amadeus MCP server (custom) | `search_flights`, `search_hotels` tools wrapping the Amadeus self-service API (sandbox environment). |
 | Playwright MCP server (Microsoft, self-built & pinned) | Browser automation to fill the mock booking site. No database or secret access. |
 | Gmail MCP server (custom) | `send_email` tool (OAuth2) for the final itinerary/confirmation email. |
@@ -72,165 +71,69 @@ LangGraph node code uniform.
 ```
 User (React chat) ⇄ FastAPI ⇄ LangGraph agent ⇄ [Amadeus MCP, Playwright MCP, Gmail MCP, HubSpot MCP]
                                      │
-                        DynamoDB (checkpoint state) + Postgres (app data)
+                        Persistence abstraction (4.4):
+                SQLite (dev/test)  or  DynamoDB + Postgres (prod)
 ```
 
-### 4.3 MCP Servers and Tool Contracts
+### 4.3 MCP Servers
 
-This section defines every MCP tool exposed by the four servers introduced in 4.1, so that
-each is a concrete contract rather than a named box. All four servers communicate over the
-**streamable HTTP MCP transport** — each runs as its own container/service, consistent with
-the NetworkPolicy-restricted, one-service-per-pod deployment model in Section 6.3 (stdio, which
-requires the client to spawn the server as a child process, does not fit that model). Every
-tool's inputs and outputs are validated against strict typed schemas per Section 6.4
-(length limits, enums, allowlists), and every tool call is wrapped in the typed-exception/
-sanitized-`error_log` pattern from Section 7.
+The system integrates four MCP servers, split between custom-built and an official,
+third-party build. Full tool contracts (input/output schemas, validation rules, error types,
+retry/timeout behavior, and test strategy) are implementation-level detail tracked in the
+codebase and the implementation plan (`docs/plan.md`, Checkpoints 17-18), not repeated here.
 
-#### 4.3.1 Amadeus MCP Server
-
-**Responsibility:** wraps the Amadeus for Developers sandbox API to provide flight and hotel
-search. Read-only — never receives traveler identity data.
-
-**`search_flights`**
-- Called by: `search_flights_and_hotels` (5.2, node 2).
-- Input schema: `{origin: str (IATA airport code), destination: str (IATA code), depart_date: date, traveler_count: int (1-9)}`.
-- Output schema: `{flights: list[FlightOption]}`, `FlightOption = {id, origin, destination, depart_at: datetime, arrive_at: datetime, price_usd: float, carrier: str, stops: int}`.
-- Validation rules: `origin`/`destination` must be valid IATA codes drawn from an allowlist; `depart_date` must be a real, non-past date; `traveler_count` bounded 1-9; malformed/oversized input rejected before any upstream call.
-- Error types: `AmadeusValidationError` (input rejected locally), `AmadeusRateLimitError`, `AmadeusTimeoutError`.
-- Timeout and retry: the tool enforces its own per-call timeout (e.g. 10s) before raising `AmadeusTimeoutError`; the calling node applies the bounded retry (3 attempts, exponential backoff) from Section 7 — the tool itself never retries internally.
-- Idempotency: not applicable — a read-only search is safe to repeat with no side effect.
-- Security boundaries: no database or encryption-key access; outbound network limited to the Amadeus sandbox host.
-- PII handling: none — inputs are trip parameters only, never traveler identity.
-- Authentication/secrets: an Amadeus sandbox API key, sourced via External Secrets Operator (6.2), held only by this server.
-- MCP transport: streamable HTTP.
-- Unit-test strategy: contract tests against recorded/mocked Amadeus sandbox responses, asserting schema validation rejects malformed/oversized/non-allowlisted input and that valid upstream responses map correctly onto `FlightOption`.
-- Real MCP transport integration-test strategy: a separate, non-default job that starts the real server and issues a real `search_flights` call over the real MCP transport against the Amadeus sandbox, gated on sandbox credentials being present.
-
-**`search_hotels`**
-- Called by: `search_flights_and_hotels` (5.2, node 2).
-- Input schema: `{destination: str (IATA city/airport code), check_in: date, check_out: date, guest_count: int (1-9)}`.
-- Output schema: `{hotels: list[HotelOption]}`, `HotelOption = {id, destination, name: str, check_in: date, check_out: date, price_usd_total: float, rating: float (0-5)}`.
-- Validation rules: `destination` allowlisted IATA code; `check_out` strictly after `check_in`; `guest_count` bounded 1-9.
-- Error types: `AmadeusValidationError`, `AmadeusRateLimitError`, `AmadeusTimeoutError`.
-- Timeout and retry: identical pattern to `search_flights`.
-- Idempotency: not applicable (read-only).
-- Security boundaries / PII handling: identical to `search_flights` — none.
-- Authentication/secrets: same Amadeus sandbox API key.
-- MCP transport: streamable HTTP.
-- Unit-test strategy: same contract-test approach as `search_flights`, scoped to hotel data.
-- Real MCP transport integration-test strategy: same non-default job, extended to cover `search_hotels`.
-
-#### 4.3.2 Playwright MCP Server
-
-**Responsibility:** browser automation that fills the mock booking site's traveler-detail form
-and captures a masked review screenshot, once per leg. This server is the system's browser-
-facing boundary and deliberately has the narrowest tool surface and the least access of any
-MCP server in the system.
-
-**Explicitly: Playwright MCP exposes no payment or booking-submission tool of any kind — its
-tool surface has exactly the two tools below, neither of which can advance the mock site past
-the review screen, because no such route exists on the site (6.5). It cannot access Postgres
-or any encryption key. It must never return raw traveler PII (passport number or date of
-birth) in any tool response, screenshot, or DOM snapshot.** This is a structural property of
-the server's tool surface and its NetworkPolicy-restricted egress (6.3), not a behavioral
-policy the agent is trusted to follow.
-
-**`fill_booking_form`**
-- Called by: the `fill_booking_form` backend node (5.2, node 8) — once per leg.
-- Input schema: `{leg_index: int, flight: {id, carrier, depart_at, arrive_at}, hotel: {id, name, check_in, check_out}, traveler: {full_name: str, date_of_birth: str, passport_number: str, contact_email: str}}`. Traveler values are decrypted and passed by the backend node in memory only, immediately before this call (6.1) — this tool never reads them from a database.
-- Output schema: `{leg_index: int, filled_fields_summary: {flight_id, hotel_id, traveler_name}, review_ready: bool}`. Deliberately excludes passport number and date of birth from the response.
-- Validation rules: `leg_index >= 0`; `flight.id`/`hotel.id` must match an id already recorded in the session's shortlist (not free text); all string fields length-bounded; no field is ever interpreted as executable content.
-- Error types: `PlaywrightTimeoutError`, `PlaywrightElementNotFoundError` (mock-site selector drift), `PlaywrightNavigationError` (raised if a caller attempts to request navigation beyond the review screen — defense in depth, since no such route exists to navigate to).
-- Timeout and retry: no automatic retry (5.2/7) — a failure routes the graph to a dedicated failure state with an explicit retry/abort choice. The tool enforces its own bounded per-action timeout (e.g. 15s) before raising `PlaywrightTimeoutError`.
-- Idempotency: not idempotent by design; the calling node does not retry automatically, so no duplicate-fill risk is introduced at this layer.
-- Security boundaries: no database connection, no encryption key, no network egress except to the mock booking site (6.3).
-- PII handling: receives traveler plaintext as call arguments only, for the duration of this call; must not persist values in browser storage, cookies, or disk; must not echo passport number or date of birth into its return value or into any DOM snapshot.
-- Authentication/secrets: none — the mock booking site requires no credentials.
-- MCP transport: streamable HTTP (the pinned Microsoft Playwright MCP build run with HTTP transport enabled).
-- Unit-test strategy: node-level tests against the `FakeBookingFormTool` (Phase 1) verifying the per-leg loop and no-retry-on-failure behavior, with no real browser involved.
-- Real MCP transport integration-test strategy: a headless run of the real server against the real mock booking site over the real MCP transport, for both a single-leg and a multi-leg booking.
-
-**`capture_masked_review_summary`**
-- Called by: the `fill_booking_form` backend node (5.2, node 8), immediately after a successful `fill_booking_form` call for the same leg.
-- Input schema: `{leg_index: int}` — operates on the page state left by the preceding call, within the same browser session.
-- Output schema: `{leg_index: int, screenshot_ref: str (opaque storage reference, not inline image bytes), masked_fields: list[str]}` (e.g. `["passport_number", "date_of_birth"]`).
-- Validation rules: `leg_index` must match the leg just filled; refuses to capture if the page is not on the expected pre-payment review screen.
-- Error types: `PlaywrightTimeoutError`, `PlaywrightMaskingError` (raised, instead of returning an image, if a field expected to be masked cannot be located and masked).
-- Timeout and retry: no automatic retry, same rationale as `fill_booking_form`.
-- Idempotency: safe to call again for the same leg (produces a fresh masked screenshot without mutating site state), though the graph calls it at most once per leg in the normal flow.
-- Security boundaries: identical to `fill_booking_form` — no database/secret access, mock-site-only egress.
-- PII handling: masks passport number and date of birth **before** capture, not after — this is the concrete enforcement point for "review screenshots contain no raw PII" (6.1, 9). Raises `PlaywrightMaskingError` rather than ever returning an unmasked image.
-- Authentication/secrets: none.
-- MCP transport: streamable HTTP, same server process as `fill_booking_form`.
-- Unit-test strategy: a fake implementation returning a canned `screenshot_ref`/`masked_fields` pair, used by node-level tests; a separate test asserts the mock site's own masking CSS/DOM behavior.
-- Real MCP transport integration-test strategy: part of the same headless run as `fill_booking_form`, additionally asserting captured screenshots contain no raw passport/DOB values for every leg.
-
-#### 4.3.3 Gmail MCP Server
-
-**Responsibility:** sends the final trip confirmation email via the Gmail API — the system's
-only outbound-communication tool.
-
-**`send_trip_summary_email`**
-- Called by: `send_confirmation_email` (5.2, node 10).
-- Input schema: `{idempotency_key: str, to: str (email address), subject: str, body: str}` — `body` is the itinerary/booking summary, never a payment receipt, since none exists.
-- Output schema: `{status: "sent" | "already_sent", message_id: str (present only when status is "sent")}`.
-- Validation rules: `to` must be a syntactically valid email address; `subject`/`body` length-bounded; `idempotency_key` required and non-empty.
-- Error types: `GmailSendError`, `GmailAuthError` (OAuth token expired/invalid — surfaced distinctly since it signals an operational/setup issue rather than a transient failure).
-- Timeout and retry: bounded retry (3 attempts, exponential backoff) at the calling node (7); a per-call timeout (e.g. 10s) at the tool level before raising `GmailSendError`.
-- Idempotency behavior: the node's Section 7 idempotency-key check (against the Postgres idempotency table) prevents a duplicate call from ever reaching this tool on retry; the tool accepts `idempotency_key` for traceability only, it does not perform the dedup itself.
-- Security boundaries: no database or encryption-key access; the Gmail OAuth token is scoped to send-only, not read/delete.
-- PII handling: the email body legitimately includes the traveler's name and itinerary (expected recipient-facing content, not a leak); this tool's `error_log` entries never include the raw body or recipient address, per the sanitization rule in 5.3.
-- Authentication/secrets: a Gmail OAuth2 client and refresh token (Testing publishing status), sourced via External Secrets Operator, held only by this server.
-- MCP transport: streamable HTTP.
-- Unit-test strategy: contract tests against a mocked Gmail API client, verifying schema validation, correct `idempotency_key` pass-through, and correct exception mapping for simulated auth/send failures.
-- Real MCP transport integration-test strategy: a separate, non-default job sending one real email to a sandbox/test recipient via the real server over the real MCP transport, gated on OAuth credentials being present.
-
-#### 4.3.4 HubSpot MCP Server
-
-**Responsibility:** writes the traveler's contact record and a trip/deal record to HubSpot CRM
-(free tier).
-
-**`upsert_contact`**
-- Called by: `update_crm` (5.2, node 11).
-- Input schema: `{email: str, full_name: str}`.
-- Output schema: `{contact_id: str}`.
-- Validation rules: `email` syntactically valid; `full_name` length-bounded.
-- Error types: `HubSpotError` (rate limit, timeout, and validation failures share this one tool-level class, distinguished by an inner `reason` code — kept simple given HubSpot's narrow free-tier surface used here).
-- Timeout and retry: bounded retry (3 attempts, exponential backoff) at the calling node; a per-call timeout at the tool level.
-- Idempotency: naturally idempotent by email address — a repeat call with the same email updates rather than duplicates the contact.
-- Security boundaries: no database or encryption-key access; only the HubSpot API key.
-- PII handling: contact email/name are the only identity data sent — passport/DOB never reach this tool.
-- Authentication/secrets: a HubSpot private-app API key, sourced via External Secrets Operator, held only by this server.
-- MCP transport: streamable HTTP.
-- Unit-test strategy: contract tests against mocked HubSpot API responses, verifying schema validation and the natural upsert-by-email idempotency.
-- Real MCP transport integration-test strategy: a separate, non-default job creating one real contact in the HubSpot free-tier sandbox account over the real MCP transport, gated on API-key credentials being present.
-
-**`create_trip_record`**
-- Called by: `update_crm` (5.2, node 11), immediately after `upsert_contact` within the same node execution.
-- Input schema: `{idempotency_key: str, contact_id: str, trip_summary: {destinations: list[str], depart_date: date, return_date: date}}`.
-- Output schema: `{status: "created" | "already_created", record_id: str (present only when status is "created")}`.
-- Validation rules: `contact_id` must reference a contact created earlier in the same call chain; `trip_summary` fields length/format-bounded; `idempotency_key` required.
-- Error types: `HubSpotError` (same class as `upsert_contact`).
-- Timeout and retry: same pattern as `upsert_contact`.
-- Idempotency behavior: same pattern as the Gmail tool — the calling node's Section 7 idempotency-key check prevents a duplicate call from ever reaching this tool on retry; the tool accepts the key for traceability only.
-- Security boundaries: identical to `upsert_contact`.
-- PII handling: `trip_summary` contains destinations and dates only — no traveler passport/DOB.
-- Authentication/secrets: same HubSpot API key.
-- MCP transport: streamable HTTP.
-- Unit-test strategy: contract tests against mocked HubSpot API responses, verifying schema validation and correct `idempotency_key` pass-through.
-- Real MCP transport integration-test strategy: part of the same non-default job as `upsert_contact`, additionally creating one real trip record and asserting a second call with the same `idempotency_key` returns `already_created` rather than a duplicate.
-
-#### 4.3.5 Node → Server → Tool Mapping
-
-| LangGraph Node | MCP Server | Tool | Expected Result |
+| Server | Type | Tools | Purpose |
 |---|---|---|---|
-| `search_flights_and_hotels` | Amadeus MCP | `search_flights` | A list of `FlightOption` for the leg, or an empty list contributing to the node's `no_results` signal. |
-| `search_flights_and_hotels` | Amadeus MCP | `search_hotels` | A list of `HotelOption` for the leg, or an empty list contributing to the node's `no_results` signal. |
-| `fill_booking_form` | Playwright MCP | `fill_booking_form` | `filled_fields_summary` and `review_ready: true` for the leg, or a `PlaywrightTimeoutError`/`PlaywrightElementNotFoundError` routing to `agent_error`. |
-| `fill_booking_form` | Playwright MCP | `capture_masked_review_summary` | `screenshot_ref` and `masked_fields` for the leg, appended to `booking_form_results`. |
-| `send_confirmation_email` | Gmail MCP | `send_trip_summary_email` | `status: "sent"` on the first call, `status: "already_sent"` on an idempotent retry. |
-| `update_crm` | HubSpot MCP | `upsert_contact` | A `contact_id`, reused across retries because the tool is naturally idempotent by email. |
-| `update_crm` | HubSpot MCP | `create_trip_record` | `status: "created"` on the first call, `status: "already_created"` on an idempotent retry. |
+| Amadeus MCP | Custom | `search_flights`, `search_hotels` | Flight and hotel search against the Amadeus sandbox API. |
+| Gmail MCP | Custom | `send_trip_summary_email` | Sends the final trip confirmation email via the Gmail API. |
+| HubSpot MCP | Custom | `upsert_contact`, `create_trip_record` | Writes the traveler's contact and trip record to HubSpot CRM. |
+| Playwright MCP | Official (Microsoft, pinned build) | `fill_booking_form`, `capture_masked_review_summary` | Fills the mock booking site's form and captures a masked review screenshot, once per leg. |
+
+Playwright MCP is deliberately the narrowest and least-privileged server in the system: it
+exposes no payment or booking-submission tool of any kind, cannot access Postgres/SQLite or
+any encryption key, and must never return raw traveler PII (passport number or date of birth)
+in any tool response, screenshot, or DOM snapshot. This is a structural property of its tool
+surface and NetworkPolicy-restricted egress (6.3), not a behavioral policy the agent is
+trusted to follow.
+
+### 4.4 Persistence Strategy
+
+Persistence is intentionally environment-dependent, and the LangGraph workflow and business
+logic are written against two interfaces so that neither the graph nor any node ever depends
+on a concrete database:
+
+- **Checkpoint storage** — LangGraph's own `BaseCheckpointSaver` abstraction (conversation/
+  graph state, one snapshot per superstep).
+- **Application data** — a project-defined `ApplicationRepository` interface (trip requests,
+  search results, encrypted traveler details, booking records, idempotency records).
+
+A factory (`get_checkpointer(settings)` / `get_repository(settings)`) selects the concrete
+implementation from `Settings.environment`:
+
+| Environment | Checkpoint storage | Application data |
+|---|---|---|
+| Local development and default test suite | SQLite, via `langgraph-checkpoint-sqlite`'s `SqliteSaver` | SQLite, via SQLAlchemy + Alembic |
+| Production | DynamoDB (the only AWS-native piece of the persistence layer) | PostgreSQL, via the same SQLAlchemy models and Alembic-managed schema, targeting a different engine |
+
+This split is deliberate, not incidental:
+
+- Local development and the default CI suite need **zero containers and zero cloud
+  credentials** for the persistence layer — SQLite is a file. This keeps the default test
+  suite fast and fully self-contained (spec §9), consistent with the existing "no live
+  third-party dependency in the default suite" principle already established for the MCP
+  servers.
+- The application-repository interface has a **single SQLAlchemy-based implementation** that
+  serves both SQLite (dev) and Postgres (prod) — SQLAlchemy's dialect abstraction, plus generic
+  column types (e.g. `JSON`, `LargeBinary` for encrypted fields), already covers the difference
+  between the two engines. Only the connection URL and the Alembic target differ.
+- The checkpoint-storage interface, by contrast, has **two genuinely distinct concrete
+  implementations** (`SqliteSaver` vs. a DynamoDB-backed `BaseCheckpointSaver`), because no
+  single driver spans a relational file format and an AWS-managed NoSQL service. This is
+  verified by testing the production adapters against the exact same behavioral contract the
+  SQLite adapter satisfies (spec §9), not merely "it doesn't crash."
+- All PII encryption (6.1), idempotency (7), and sanitized error handling apply identically
+  regardless of which adapter is active — they are implemented once, against the interfaces,
+  not once per database.
 
 ## 5. LangGraph Workflow
 
@@ -265,8 +168,9 @@ prevents the model from choosing to skip it.
 6. **`finalize_itinerary`** — Regenerates/adjusts the itinerary to incorporate the actual
    selected flight times and hotel locations.
 7. **`collect_traveler_details`** — Gathers per-traveler details required by the mock site's
-   form. Writes to a dedicated, encrypted `traveler_details` Postgres table; graph state holds
-   only a `traveler_details_id` foreign key, never the raw values (see Section 6.1).
+   form. Writes to a dedicated, encrypted `traveler_details` row via the `ApplicationRepository`
+   interface (4.4 — SQLite locally, Postgres in production); graph state holds only a
+   `traveler_details_id` reference, never the raw values (see Section 6.1).
 8. **`fill_booking_form`** — The mock booking site models a single flight+hotel transaction, so
    for a multi-leg trip this node **loops once per leg**: the **backend node** (not the
    Playwright MCP server) fetches and decrypts the traveler record just-in-time for that leg,
@@ -319,10 +223,11 @@ OAuth tokens, API keys, or raw third-party responses.
 
 ### 6.1 Sensitive Data Handling
 
-LangGraph's DynamoDB-backed checkpointer persists a snapshot of the full graph state after
-every node, across multiple checkpoint items (one per superstep). This means sensitive fields
-placed directly on graph state would be written into DynamoDB multiple times, not avoided by
-being "only in state." The design instead is:
+LangGraph's checkpointer (SQLite locally, DynamoDB in production — 4.4) persists a snapshot of
+the full graph state after every node, across multiple checkpoint entries (one per superstep).
+This means sensitive fields placed directly on graph state would be written into the
+checkpoint store multiple times, not avoided by being "only in state," regardless of which
+adapter is active. The design instead is:
 
 - Traveler details (including passport/ID) are written to a dedicated `traveler_details`
   table, not onto the graph state object.
@@ -346,7 +251,9 @@ being "only in state." The design instead is:
 
 - All secrets (Amadeus API key, Gmail OAuth client/token, HubSpot API key, DB encryption key,
   Postgres credentials) live in Kubernetes Secrets, created at runtime by the **External
-  Secrets Operator** from **AWS Secrets Manager**.
+  Secrets Operator** from **AWS Secrets Manager**. This applies to the deployed (`dev`/`prod`)
+  environment only — local development uses SQLite and requires no persistence-layer secrets
+  or cloud credentials at all (4.4).
 - The backend's access to the DynamoDB checkpoint table is **not** a Secrets Manager credential
   — it is granted via an IAM role scoped to that one table (read/write only), following the
   same least-privilege principle through a different AWS-native mechanism.
@@ -512,11 +419,15 @@ official Playwright MCP source, pinned to a specific version/commit** — never 
   verbatim, not just via pattern match — in checkpoints, logs, metrics, traces, screenshots,
   browser storage, or MCP responses. Pattern matching (e.g. passport-shaped strings) is an
   additional safeguard, not the primary check.
-- **Postgres tests**: migrations from an empty database, foreign-key constraints, encrypted-
-  column round-trip correctness, and retention/purge job behavior.
-- **DynamoDB checkpointer tests**: checkpoint-item creation and round-trip against a local
-  DynamoDB endpoint or a mocked AWS SDK, kept out of the live-third-party-API restriction above
-  since it's the application's own persistence layer, not an external service.
+- **SQLite persistence tests (default suite)**: migrations from an empty database, foreign-key
+  constraints, encrypted-column round-trip correctness, retention/purge job behavior, and
+  checkpoint creation/round-trip via `SqliteSaver` — all run with zero containers and zero
+  cloud credentials (4.4).
+- **Production-adapter integration tests**: the same repository contract-test suite re-run
+  against `PostgresApplicationRepository`, plus checkpoint creation/round-trip against the
+  DynamoDB-backed checkpointer, proving both production adapters satisfy the same interface
+  and behavior as their SQLite counterparts. Run as a separate, non-default job (mirroring the
+  MCP live-integration pattern), gated on database/AWS credentials being present.
 - **Playwright/mock-site tests**: component tests for the mock site's form validation; a
   Playwright suite runs the fill flow headless in CI against a running instance, including a
   multi-leg case (asserting the per-leg loop produces one filled-form summary per leg and the
@@ -561,15 +472,19 @@ official Playwright MCP source, pinned to a specific version/commit** — never 
 
 ## 11. Roadmap (Implementation Phases)
 
-1. **Local development — core agent logic.** LangGraph agent + mocked MCP tools + Postgres
-   (application data) + local DynamoDB (checkpointer), no infra. Proves the workflow logic,
-   both `interrupt()` gates, and retry/error handling work correctly in isolation.
+1. **Local development — core agent logic.** LangGraph agent + mocked MCP tools, persisted
+   entirely on SQLite (both the checkpointer and application data, behind the interfaces in
+   4.4), no infra. Proves the workflow logic, both `interrupt()` gates, and retry/error
+   handling work correctly in isolation.
 2. **Local development — real integrations.** Real MCP servers (Amadeus, Gmail, HubSpot,
    Playwright) wired in against sandboxes; mock booking site built and automated end-to-end.
-   Still running locally/Docker Compose.
+   Still running locally/Docker Compose, still on SQLite.
 3. **Infrastructure provisioning.** Terraform + Packer build the AMI and AWS networking;
    kubeadm cluster stood up (control plane via `user_data`, workers via SSM join); NetworkPolicies
-   and External Secrets Operator wired in.
+   and External Secrets Operator wired in. The production persistence adapters (Postgres
+   repository, DynamoDB checkpointer) are implemented and verified here against real or
+   containerized instances, satisfying the same interfaces the SQLite adapters already proved
+   out in phase 1.
 4. **Kubernetes deployment.** All application services deployed to the cluster via Kustomize
    overlays (`dev` first), manually applied to validate manifests before GitOps takes over.
 5. **CI/CD and GitOps.** GitHub Actions pipeline (lint/test/build/tag-bump) wired to Argo CD,
