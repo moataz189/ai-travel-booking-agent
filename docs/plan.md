@@ -39,16 +39,21 @@
 ## Checkpoint 2: Project Scaffolding and Configuration
 
 **Files:**
-- Create: `backend/pyproject.toml`
+- Create: `backend/requirements.txt`
+- Create: `backend/requirements-dev.txt`
+- Create: `backend/pytest.ini`
 - Create: `backend/app/config.py`
 - Create: `docker-compose.yml`
 - Create: `backend/tests/conftest.py`
 
-**Deliverable:** Installable backend package with settings and a local Postgres container.
+**Deliverable:** A `pip`-installable backend dependency set with settings and a local Postgres container.
 
-- [ ] Add dependencies (FastAPI, LangGraph, SQLAlchemy, Alembic, Pydantic, cryptography, anthropic, pytest).
+- [ ] List runtime dependencies in `requirements.txt` (FastAPI, LangGraph, SQLAlchemy, Alembic, Pydantic, cryptography, anthropic).
+- [ ] List test/dev dependencies in `requirements-dev.txt` (pytest, pytest-asyncio, httpx), referencing `-r requirements.txt`.
+- [ ] Configure `pytest.ini` (`pythonpath = .`, `asyncio_mode = auto`, `testpaths = tests`) so `app` imports resolve without installing the project as a package.
 - [ ] Implement `Settings` loaded from environment variables.
 - [ ] Add a `docker-compose.yml` Postgres service for local dev/test.
+- [ ] Verify `pip install -r requirements.txt -r requirements-dev.txt` succeeds in a fresh virtual environment.
 - [ ] Test that settings load with correct defaults and types.
 
 ## Checkpoint 3: Domain Models, State Schema, and PII Encryption
