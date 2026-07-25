@@ -74,6 +74,163 @@ User (React chat) ⇄ FastAPI ⇄ LangGraph agent ⇄ [Amadeus MCP, Playwright M
                                  Postgres (state + app data)
 ```
 
+### 4.3 MCP Servers and Tool Contracts
+
+This section defines every MCP tool exposed by the four servers introduced in 4.1, so that
+each is a concrete contract rather than a named box. All four servers communicate over the
+**streamable HTTP MCP transport** — each runs as its own container/service, consistent with
+the NetworkPolicy-restricted, one-service-per-pod deployment model in Section 6.3 (stdio, which
+requires the client to spawn the server as a child process, does not fit that model). Every
+tool's inputs and outputs are validated against strict typed schemas per Section 6.4
+(length limits, enums, allowlists), and every tool call is wrapped in the typed-exception/
+sanitized-`error_log` pattern from Section 7.
+
+#### 4.3.1 Amadeus MCP Server
+
+**Responsibility:** wraps the Amadeus for Developers sandbox API to provide flight and hotel
+search. Read-only — never receives traveler identity data.
+
+**`search_flights`**
+- Called by: `search_flights_and_hotels` (5.2, node 2).
+- Input schema: `{origin: str (IATA airport code), destination: str (IATA code), depart_date: date, traveler_count: int (1-9)}`.
+- Output schema: `{flights: list[FlightOption]}`, `FlightOption = {id, origin, destination, depart_at: datetime, arrive_at: datetime, price_usd: float, carrier: str, stops: int}`.
+- Validation rules: `origin`/`destination` must be valid IATA codes drawn from an allowlist; `depart_date` must be a real, non-past date; `traveler_count` bounded 1-9; malformed/oversized input rejected before any upstream call.
+- Error types: `AmadeusValidationError` (input rejected locally), `AmadeusRateLimitError`, `AmadeusTimeoutError`.
+- Timeout and retry: the tool enforces its own per-call timeout (e.g. 10s) before raising `AmadeusTimeoutError`; the calling node applies the bounded retry (3 attempts, exponential backoff) from Section 7 — the tool itself never retries internally.
+- Idempotency: not applicable — a read-only search is safe to repeat with no side effect.
+- Security boundaries: no database or encryption-key access; outbound network limited to the Amadeus sandbox host.
+- PII handling: none — inputs are trip parameters only, never traveler identity.
+- Authentication/secrets: an Amadeus sandbox API key, sourced via External Secrets Operator (6.2), held only by this server.
+- MCP transport: streamable HTTP.
+- Unit-test strategy: contract tests against recorded/mocked Amadeus sandbox responses, asserting schema validation rejects malformed/oversized/non-allowlisted input and that valid upstream responses map correctly onto `FlightOption`.
+- Real MCP transport integration-test strategy: a separate, non-default job that starts the real server and issues a real `search_flights` call over the real MCP transport against the Amadeus sandbox, gated on sandbox credentials being present.
+
+**`search_hotels`**
+- Called by: `search_flights_and_hotels` (5.2, node 2).
+- Input schema: `{destination: str (IATA city/airport code), check_in: date, check_out: date, guest_count: int (1-9)}`.
+- Output schema: `{hotels: list[HotelOption]}`, `HotelOption = {id, destination, name: str, check_in: date, check_out: date, price_usd_total: float, rating: float (0-5)}`.
+- Validation rules: `destination` allowlisted IATA code; `check_out` strictly after `check_in`; `guest_count` bounded 1-9.
+- Error types: `AmadeusValidationError`, `AmadeusRateLimitError`, `AmadeusTimeoutError`.
+- Timeout and retry: identical pattern to `search_flights`.
+- Idempotency: not applicable (read-only).
+- Security boundaries / PII handling: identical to `search_flights` — none.
+- Authentication/secrets: same Amadeus sandbox API key.
+- MCP transport: streamable HTTP.
+- Unit-test strategy: same contract-test approach as `search_flights`, scoped to hotel data.
+- Real MCP transport integration-test strategy: same non-default job, extended to cover `search_hotels`.
+
+#### 4.3.2 Playwright MCP Server
+
+**Responsibility:** browser automation that fills the mock booking site's traveler-detail form
+and captures a masked review screenshot, once per leg. This server is the system's browser-
+facing boundary and deliberately has the narrowest tool surface and the least access of any
+MCP server in the system.
+
+**Explicitly: Playwright MCP exposes no payment or booking-submission tool of any kind — its
+tool surface has exactly the two tools below, neither of which can advance the mock site past
+the review screen, because no such route exists on the site (6.5). It cannot access Postgres
+or any encryption key. It must never return raw traveler PII (passport number or date of
+birth) in any tool response, screenshot, or DOM snapshot.** This is a structural property of
+the server's tool surface and its NetworkPolicy-restricted egress (6.3), not a behavioral
+policy the agent is trusted to follow.
+
+**`fill_booking_form`**
+- Called by: the `fill_booking_form` backend node (5.2, node 8) — once per leg.
+- Input schema: `{leg_index: int, flight: {id, carrier, depart_at, arrive_at}, hotel: {id, name, check_in, check_out}, traveler: {full_name: str, date_of_birth: str, passport_number: str, contact_email: str}}`. Traveler values are decrypted and passed by the backend node in memory only, immediately before this call (6.1) — this tool never reads them from a database.
+- Output schema: `{leg_index: int, filled_fields_summary: {flight_id, hotel_id, traveler_name}, review_ready: bool}`. Deliberately excludes passport number and date of birth from the response.
+- Validation rules: `leg_index >= 0`; `flight.id`/`hotel.id` must match an id already recorded in the session's shortlist (not free text); all string fields length-bounded; no field is ever interpreted as executable content.
+- Error types: `PlaywrightTimeoutError`, `PlaywrightElementNotFoundError` (mock-site selector drift), `PlaywrightNavigationError` (raised if a caller attempts to request navigation beyond the review screen — defense in depth, since no such route exists to navigate to).
+- Timeout and retry: no automatic retry (5.2/7) — a failure routes the graph to a dedicated failure state with an explicit retry/abort choice. The tool enforces its own bounded per-action timeout (e.g. 15s) before raising `PlaywrightTimeoutError`.
+- Idempotency: not idempotent by design; the calling node does not retry automatically, so no duplicate-fill risk is introduced at this layer.
+- Security boundaries: no database connection, no encryption key, no network egress except to the mock booking site (6.3).
+- PII handling: receives traveler plaintext as call arguments only, for the duration of this call; must not persist values in browser storage, cookies, or disk; must not echo passport number or date of birth into its return value or into any DOM snapshot.
+- Authentication/secrets: none — the mock booking site requires no credentials.
+- MCP transport: streamable HTTP (the pinned Microsoft Playwright MCP build run with HTTP transport enabled).
+- Unit-test strategy: node-level tests against the `FakeBookingFormTool` (Phase 1) verifying the per-leg loop and no-retry-on-failure behavior, with no real browser involved.
+- Real MCP transport integration-test strategy: a headless run of the real server against the real mock booking site over the real MCP transport, for both a single-leg and a multi-leg booking.
+
+**`capture_masked_review_summary`**
+- Called by: the `fill_booking_form` backend node (5.2, node 8), immediately after a successful `fill_booking_form` call for the same leg.
+- Input schema: `{leg_index: int}` — operates on the page state left by the preceding call, within the same browser session.
+- Output schema: `{leg_index: int, screenshot_ref: str (opaque storage reference, not inline image bytes), masked_fields: list[str]}` (e.g. `["passport_number", "date_of_birth"]`).
+- Validation rules: `leg_index` must match the leg just filled; refuses to capture if the page is not on the expected pre-payment review screen.
+- Error types: `PlaywrightTimeoutError`, `PlaywrightMaskingError` (raised, instead of returning an image, if a field expected to be masked cannot be located and masked).
+- Timeout and retry: no automatic retry, same rationale as `fill_booking_form`.
+- Idempotency: safe to call again for the same leg (produces a fresh masked screenshot without mutating site state), though the graph calls it at most once per leg in the normal flow.
+- Security boundaries: identical to `fill_booking_form` — no database/secret access, mock-site-only egress.
+- PII handling: masks passport number and date of birth **before** capture, not after — this is the concrete enforcement point for "review screenshots contain no raw PII" (6.1, 9). Raises `PlaywrightMaskingError` rather than ever returning an unmasked image.
+- Authentication/secrets: none.
+- MCP transport: streamable HTTP, same server process as `fill_booking_form`.
+- Unit-test strategy: a fake implementation returning a canned `screenshot_ref`/`masked_fields` pair, used by node-level tests; a separate test asserts the mock site's own masking CSS/DOM behavior.
+- Real MCP transport integration-test strategy: part of the same headless run as `fill_booking_form`, additionally asserting captured screenshots contain no raw passport/DOB values for every leg.
+
+#### 4.3.3 Gmail MCP Server
+
+**Responsibility:** sends the final trip confirmation email via the Gmail API — the system's
+only outbound-communication tool.
+
+**`send_trip_summary_email`**
+- Called by: `send_confirmation_email` (5.2, node 10).
+- Input schema: `{idempotency_key: str, to: str (email address), subject: str, body: str}` — `body` is the itinerary/booking summary, never a payment receipt, since none exists.
+- Output schema: `{status: "sent" | "already_sent", message_id: str (present only when status is "sent")}`.
+- Validation rules: `to` must be a syntactically valid email address; `subject`/`body` length-bounded; `idempotency_key` required and non-empty.
+- Error types: `GmailSendError`, `GmailAuthError` (OAuth token expired/invalid — surfaced distinctly since it signals an operational/setup issue rather than a transient failure).
+- Timeout and retry: bounded retry (3 attempts, exponential backoff) at the calling node (7); a per-call timeout (e.g. 10s) at the tool level before raising `GmailSendError`.
+- Idempotency behavior: the node's Section 7 idempotency-key check (against the Postgres idempotency table) prevents a duplicate call from ever reaching this tool on retry; the tool accepts `idempotency_key` for traceability only, it does not perform the dedup itself.
+- Security boundaries: no database or encryption-key access; the Gmail OAuth token is scoped to send-only, not read/delete.
+- PII handling: the email body legitimately includes the traveler's name and itinerary (expected recipient-facing content, not a leak); this tool's `error_log` entries never include the raw body or recipient address, per the sanitization rule in 5.3.
+- Authentication/secrets: a Gmail OAuth2 client and refresh token (Testing publishing status), sourced via External Secrets Operator, held only by this server.
+- MCP transport: streamable HTTP.
+- Unit-test strategy: contract tests against a mocked Gmail API client, verifying schema validation, correct `idempotency_key` pass-through, and correct exception mapping for simulated auth/send failures.
+- Real MCP transport integration-test strategy: a separate, non-default job sending one real email to a sandbox/test recipient via the real server over the real MCP transport, gated on OAuth credentials being present.
+
+#### 4.3.4 HubSpot MCP Server
+
+**Responsibility:** writes the traveler's contact record and a trip/deal record to HubSpot CRM
+(free tier).
+
+**`upsert_contact`**
+- Called by: `update_crm` (5.2, node 11).
+- Input schema: `{email: str, full_name: str}`.
+- Output schema: `{contact_id: str}`.
+- Validation rules: `email` syntactically valid; `full_name` length-bounded.
+- Error types: `HubSpotError` (rate limit, timeout, and validation failures share this one tool-level class, distinguished by an inner `reason` code — kept simple given HubSpot's narrow free-tier surface used here).
+- Timeout and retry: bounded retry (3 attempts, exponential backoff) at the calling node; a per-call timeout at the tool level.
+- Idempotency: naturally idempotent by email address — a repeat call with the same email updates rather than duplicates the contact.
+- Security boundaries: no database or encryption-key access; only the HubSpot API key.
+- PII handling: contact email/name are the only identity data sent — passport/DOB never reach this tool.
+- Authentication/secrets: a HubSpot private-app API key, sourced via External Secrets Operator, held only by this server.
+- MCP transport: streamable HTTP.
+- Unit-test strategy: contract tests against mocked HubSpot API responses, verifying schema validation and the natural upsert-by-email idempotency.
+- Real MCP transport integration-test strategy: a separate, non-default job creating one real contact in the HubSpot free-tier sandbox account over the real MCP transport, gated on API-key credentials being present.
+
+**`create_trip_record`**
+- Called by: `update_crm` (5.2, node 11), immediately after `upsert_contact` within the same node execution.
+- Input schema: `{idempotency_key: str, contact_id: str, trip_summary: {destinations: list[str], depart_date: date, return_date: date}}`.
+- Output schema: `{status: "created" | "already_created", record_id: str (present only when status is "created")}`.
+- Validation rules: `contact_id` must reference a contact created earlier in the same call chain; `trip_summary` fields length/format-bounded; `idempotency_key` required.
+- Error types: `HubSpotError` (same class as `upsert_contact`).
+- Timeout and retry: same pattern as `upsert_contact`.
+- Idempotency behavior: same pattern as the Gmail tool — the calling node's Section 7 idempotency-key check prevents a duplicate call from ever reaching this tool on retry; the tool accepts the key for traceability only.
+- Security boundaries: identical to `upsert_contact`.
+- PII handling: `trip_summary` contains destinations and dates only — no traveler passport/DOB.
+- Authentication/secrets: same HubSpot API key.
+- MCP transport: streamable HTTP.
+- Unit-test strategy: contract tests against mocked HubSpot API responses, verifying schema validation and correct `idempotency_key` pass-through.
+- Real MCP transport integration-test strategy: part of the same non-default job as `upsert_contact`, additionally creating one real trip record and asserting a second call with the same `idempotency_key` returns `already_created` rather than a duplicate.
+
+#### 4.3.5 Node → Server → Tool Mapping
+
+| LangGraph Node | MCP Server | Tool | Expected Result |
+|---|---|---|---|
+| `search_flights_and_hotels` | Amadeus MCP | `search_flights` | A list of `FlightOption` for the leg, or an empty list contributing to the node's `no_results` signal. |
+| `search_flights_and_hotels` | Amadeus MCP | `search_hotels` | A list of `HotelOption` for the leg, or an empty list contributing to the node's `no_results` signal. |
+| `fill_booking_form` | Playwright MCP | `fill_booking_form` | `filled_fields_summary` and `review_ready: true` for the leg, or a `PlaywrightTimeoutError`/`PlaywrightElementNotFoundError` routing to `agent_error`. |
+| `fill_booking_form` | Playwright MCP | `capture_masked_review_summary` | `screenshot_ref` and `masked_fields` for the leg, appended to `booking_form_results`. |
+| `send_confirmation_email` | Gmail MCP | `send_trip_summary_email` | `status: "sent"` on the first call, `status: "already_sent"` on an idempotent retry. |
+| `update_crm` | HubSpot MCP | `upsert_contact` | A `contact_id`, reused across retries because the tool is naturally idempotent by email. |
+| `update_crm` | HubSpot MCP | `create_trip_record` | `status: "created"` on the first call, `status: "already_created"` on an idempotent retry. |
+
 ## 5. LangGraph Workflow
 
 ### 5.1 Orchestration Approach
